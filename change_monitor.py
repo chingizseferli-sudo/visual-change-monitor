@@ -119,14 +119,22 @@ def get_domain(url):
 
 def is_due(source):
     now = utc_now()
+    due, _reason = get_due_decision(source, now)
+    return due
+
+
+def get_due_decision(source, now=None):
+    now = now or utc_now()
     next_check = parse_dt(source.get("next_check_at"))
     backoff_until = parse_dt(source.get("backoff_until"))
 
     if backoff_until and backoff_until > now:
-        return False
+        return False, "backoff_active"
     if not next_check:
-        return True
-    return next_check <= now
+        return True, "no_next_check"
+    if next_check <= now:
+        return True, "due"
+    return False, "next_check_future"
 
 
 def get_due_sources(config):
@@ -141,7 +149,26 @@ def get_due_sources(config):
             "limit": str(config["due_batch_limit"] * 3),
         },
     ) or []
-    due = [row for row in rows if is_due(row)]
+    now = utc_now()
+    due = []
+    skip_counts = {}
+    skip_samples = []
+    for row in rows:
+        is_row_due, reason = get_due_decision(row, now)
+        if is_row_due:
+            due.append(row)
+        else:
+            skip_counts[reason] = skip_counts.get(reason, 0) + 1
+            if len(skip_samples) < 5:
+                skip_samples.append(
+                    f"{row.get('name') or row.get('url')}:{reason}:next={row.get('next_check_at')}:backoff={row.get('backoff_until')}"
+                )
+    print(
+        f"Due scan: active_loaded={len(rows)} | due={len(due)} | skipped={skip_counts or {}}",
+        flush=True,
+    )
+    if skip_samples and not due:
+        print(f"Due skip samples: {' | '.join(skip_samples)}", flush=True)
     return due[: config["due_batch_limit"]]
 
 
