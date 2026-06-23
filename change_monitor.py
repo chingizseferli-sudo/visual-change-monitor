@@ -137,6 +137,63 @@ def get_due_decision(source, now=None):
     return False, "next_check_future"
 
 
+def source_queue_key(source):
+    source_id = str(source.get("id") or "").strip()
+    if source_id:
+        return f"id:{source_id}"
+    url = str(source.get("url") or "").strip().lower().rstrip("/")
+    if url:
+        return f"url:{url}"
+    return f"unknown:{id(source)}"
+
+
+def source_url_key(source):
+    return str(source.get("url") or "").strip().lower().rstrip("/")
+
+
+def unique_due_sources(due_sources, limit):
+    unique = []
+    seen_ids = set()
+    seen_urls = set()
+    duplicate_counts = {"id": 0, "url": 0}
+    duplicate_samples = []
+
+    for source in due_sources:
+        queue_key = source_queue_key(source)
+        url_key = source_url_key(source)
+        duplicate_reason = None
+
+        if queue_key in seen_ids:
+            duplicate_reason = "id"
+        elif url_key and url_key in seen_urls:
+            duplicate_reason = "url"
+
+        if duplicate_reason:
+            duplicate_counts[duplicate_reason] += 1
+            if len(duplicate_samples) < 5:
+                duplicate_samples.append(
+                    f"{source.get('name') or source.get('url')}:{duplicate_reason}:{source.get('id') or source.get('url')}"
+                )
+            continue
+
+        seen_ids.add(queue_key)
+        if url_key:
+            seen_urls.add(url_key)
+        unique.append(source)
+        if len(unique) >= limit:
+            break
+
+    duplicate_counts = {key: value for key, value in duplicate_counts.items() if value}
+    if duplicate_counts:
+        print(
+            f"Queue dedupe: removed={sum(duplicate_counts.values())} | reasons={duplicate_counts}",
+            flush=True,
+        )
+        if duplicate_samples:
+            print(f"Queue duplicate samples: {' | '.join(duplicate_samples)}", flush=True)
+    return unique
+
+
 def get_due_sources(config):
     rows = supabase_request(
         "GET",
@@ -163,13 +220,14 @@ def get_due_sources(config):
                 skip_samples.append(
                     f"{row.get('name') or row.get('url')}:{reason}:next={row.get('next_check_at')}:backoff={row.get('backoff_until')}"
                 )
+    unique_due = unique_due_sources(due, config["due_batch_limit"])
     print(
-        f"Due scan: active_loaded={len(rows)} | due={len(due)} | skipped={skip_counts or {}}",
+        f"Due scan: active_loaded={len(rows)} | due={len(due)} | queued={len(unique_due)} | skipped={skip_counts or {}}",
         flush=True,
     )
-    if skip_samples and not due:
+    if skip_samples and not unique_due:
         print(f"Due skip samples: {' | '.join(skip_samples)}", flush=True)
-    return due[: config["due_batch_limit"]]
+    return unique_due
 
 
 def update_source(source_id, payload, config):
@@ -324,6 +382,19 @@ def extract_selected_content(html, selector):
 
 def calculate_hash(content_text):
     return hashlib.sha256((content_text or "").encode("utf-8")).hexdigest()
+
+
+def hash_diagnostic_state(source, old_hash, new_hash):
+    if not old_hash:
+        return "baseline"
+    if new_hash == old_hash:
+        return "unchanged"
+
+    last_changed_at = parse_dt(source.get("last_changed_at"))
+    interval_minutes = int(source.get("interval_minutes") or 5)
+    if last_changed_at and utc_now() - last_changed_at < timedelta(minutes=max(10, interval_minutes * 2)):
+        return "possible_noisy_page"
+    return "changed"
 
 
 def calculate_next_check_at(interval_minutes, config):
@@ -499,14 +570,15 @@ def check_source(source, config, domain_limiter):
             raise ValueError("empty_content")
         new_hash = calculate_hash(content_text)
         old_hash = source.get("content_hash")
+        hash_state = hash_diagnostic_state(source, old_hash, new_hash)
         print(
-            f"Selector extracted: {name} | selector={source.get('selector')} | chars={len(content_text)} | hash={new_hash[:12]}",
+            f"Selector extracted: {name} | selector={source.get('selector')} | chars={len(content_text)} | hash_state={hash_state} | hash={new_hash[:12]}",
             flush=True,
         )
 
         if not old_hash:
             if config["dry_run"]:
-                print(f"[DRY_RUN] baseline would be created: {name} | hash={new_hash[:12]}", flush=True)
+                print(f"[DRY_RUN] baseline would be created: {name} | hash_state=baseline | hash={new_hash[:12]}", flush=True)
             snapshot = insert_snapshot(
                 source_id,
                 content_text,
@@ -522,14 +594,17 @@ def check_source(source, config, domain_limiter):
 
         if new_hash == old_hash:
             if config["dry_run"]:
-                print(f"[DRY_RUN] no-change source update would be written: {name}", flush=True)
+                print(f"[DRY_RUN] no-change source update would be written: {name} | hash_state=unchanged", flush=True)
             payload = success_source_payload(source, new_hash, fetch_result, config)
             update_source(source_id, payload, config)
             print(f"No change: {name}", flush=True)
             return
 
         if config["dry_run"]:
-            print(f"[DRY_RUN] change would be recorded: {name} | old={str(old_hash)[:12]} | new={new_hash[:12]}", flush=True)
+            print(
+                f"[DRY_RUN] change would be recorded: {name} | hash_state={hash_state} | old={str(old_hash)[:12]} | new={new_hash[:12]}",
+                flush=True,
+            )
         latest_snapshot = get_latest_snapshot(source_id, config)
         new_snapshot = insert_snapshot(
             source_id,
