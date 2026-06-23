@@ -5,8 +5,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from difflib import unified_diff
-from email.utils import format_datetime
 from urllib.parse import urlparse
 
 import requests
@@ -281,7 +279,7 @@ def get_latest_snapshot(source_id, config):
         "change_snapshots",
         config,
         params={
-            "select": "id,content_hash,captured_at",
+            "select": "id,content_hash,content_text,captured_at",
             "source_id": f"eq.{source_id}",
             "order": "captured_at.desc",
             "limit": "1",
@@ -373,7 +371,14 @@ def send_telegram(config, chat_id, text):
 
 
 def normalize_text(text, max_chars):
-    normalized = " ".join((text or "").split()).strip()
+    lines = []
+    for line in (text or "").splitlines():
+        cleaned = " ".join(line.split()).strip()
+        if cleaned:
+            lines.append(cleaned)
+    normalized = "\n".join(lines)
+    if not normalized:
+        normalized = " ".join((text or "").split()).strip()
     if max_chars and len(normalized) > max_chars:
         normalized = normalized[:max_chars]
     return normalized
@@ -518,15 +523,79 @@ def fetch_source(source, config):
     }
 
 
-def build_diff_summary(old_text, new_text, max_chars=1000):
-    old_lines = (old_text or "").split()
-    new_lines = (new_text or "").split()
-    diff = unified_diff(old_lines, new_lines, lineterm="", n=2)
-    interesting = [line for line in diff if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
-    summary = " ".join(interesting[:30]).strip()
+def clean_change_lines(text):
+    seen = set()
+    lines = []
+    for raw_line in (text or "").splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            continue
+        key = line.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(line)
+    if lines:
+        return lines
+
+    fallback = " ".join((text or "").split()).strip()
+    return [fallback] if fallback else []
+
+
+def compare_change_lines(old_text, new_text):
+    old_lines = clean_change_lines(old_text)
+    new_lines = clean_change_lines(new_text)
+    old_set = {line.casefold() for line in old_lines}
+    new_set = {line.casefold() for line in new_lines}
+    added = [line for line in new_lines if line.casefold() not in old_set]
+    removed = [line for line in old_lines if line.casefold() not in new_set]
+    return added, removed
+
+
+def truncate_item(text, max_chars=180):
+    text = " ".join((text or "").split()).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def format_change_section(title, items, limit=10):
+    if not items:
+        return ""
+    shown = [f"• {truncate_item(item)}" for item in items[:limit]]
+    extra = len(items) - limit
+    if extra > 0:
+        shown.append(f"... və {extra} əlavə")
+    return f"{title}:\n" + "\n".join(shown)
+
+
+def build_diff_summary(old_text, new_text, noisy=False, max_chars=1200):
+    added, removed = compare_change_lines(old_text, new_text)
+    sections = [
+        format_change_section("Yeni əlavə olunanlar", added),
+        format_change_section("Silinənlər", removed),
+    ]
+    summary = "\n\n".join(section for section in sections if section).strip()
     if not summary:
-        summary = new_text[:max_chars]
+        summary = "Mətn dəyişib, amma əlavə/silinən sətrlər ayrıca müəyyənləşdirilə bilmədi."
+    if noisy:
+        summary = f"{summary}\n\nQeyd: Səhifə tez-tez dəyişə bilər."
     return summary[:max_chars]
+
+
+def format_baku_time(value=None):
+    dt = value or utc_now()
+    return dt.astimezone(timezone(timedelta(hours=4))).strftime("%d.%m.%Y %H:%M")
+
+
+def build_telegram_message(name, url, diff_summary):
+    return (
+        "🔔 Dəyişiklik aşkarlandı\n\n"
+        f"Mənbə: {name}\n"
+        f"URL: {url}\n\n"
+        f"{diff_summary}\n\n"
+        f"Vaxt: {format_baku_time()}"
+    )
 
 
 def success_source_payload(source, content_hash, fetch_result, config, changed=False):
@@ -625,7 +694,8 @@ def check_source(source, config, domain_limiter):
             fetch_result["response_time_ms"],
             config,
         )
-        diff_summary = build_diff_summary(old_hash or "", content_text)
+        previous_text = latest_snapshot.get("content_text") if latest_snapshot else ""
+        diff_summary = build_diff_summary(previous_text or "", content_text, noisy=hash_state == "possible_noisy_page")
         event = insert_change_event(
             source_id,
             latest_snapshot.get("id") if latest_snapshot else None,
@@ -638,14 +708,7 @@ def check_source(source, config, domain_limiter):
         chat_id = source.get("telegram_chat_id") or config["default_chat_id"]
         alert = insert_alert(event.get("id") if event else None, source_id, chat_id, config)
 
-        message = (
-            "🔔 Dəyişiklik aşkarlandı\n\n"
-            f"Mənbə: {name}\n"
-            f"URL: {source.get('url')}\n\n"
-            "Dəyişən hissə:\n"
-            f"{diff_summary}\n\n"
-            f"Vaxt: {format_datetime(utc_now())}"
-        )
+        message = build_telegram_message(name, source.get("url"), diff_summary)
         ok, error = send_telegram(config, chat_id, message)
         if ok:
             update_alert(alert.get("id") if alert else None, {"status": "sent", "sent_at": iso_now(), "error": None}, config)
