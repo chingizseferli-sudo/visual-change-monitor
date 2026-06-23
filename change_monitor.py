@@ -1,4 +1,4 @@
-﻿import hashlib
+import hashlib
 import os
 import random
 import re
@@ -502,26 +502,73 @@ def extract_link_items(elements, base_url):
                 title = absolute_url
 
             seen.add(absolute_url)
-            items.append({"title": title, "url": absolute_url, "published_text": published_text})
+            items.append({
+                "title": title,
+                "url": absolute_url,
+                "published": published_text,
+                "published_text": published_text,
+                "image": "",
+            })
     return items
 
-
 def serialize_link_items(link_items):
-    lines = []
-    for item in link_items:
-        if not item.get("url"):
+    normalized_items = []
+    seen = set()
+    for item in link_items or []:
+        url = normalize_item_url(item.get("url"), "")
+        if not url or url in seen:
             continue
-        parts = [item.get("title") or item["url"], item["url"]]
-        if item.get("published_text"):
-            parts.append(item["published_text"])
-        lines.append(" || ".join(parts))
-    return "\n".join(lines)
+        published = item.get("published") or item.get("published_text") or ""
+        title = clean_item_title(item.get("title"), published) or url
+        normalized_items.append({
+            "title": title,
+            "url": url,
+            "published": published,
+            "image": item.get("image") or "",
+        })
+        seen.add(url)
 
+    return json.dumps(
+        {"items": normalized_items},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 def parse_link_items_from_snapshot(text):
     items = []
     seen = set()
-    for raw_line in (text or "").splitlines():
+    raw_text = (text or "").strip()
+
+    if not raw_text:
+        return items
+
+    if raw_text.startswith("{"):
+        try:
+            payload = json.loads(raw_text)
+            raw_items = payload.get("items") if isinstance(payload, dict) else []
+            if isinstance(raw_items, list):
+                for raw_item in raw_items:
+                    if not isinstance(raw_item, dict):
+                        continue
+                    published_text = raw_item.get("published") or raw_item.get("published_text") or ""
+                    url = normalize_item_url(raw_item.get("url"), "")
+                    if not url or url in seen:
+                        continue
+                    seen.add(url)
+                    items.append({
+                        "title": clean_item_title(raw_item.get("title"), published_text) or url,
+                        "url": url,
+                        "published": published_text,
+                        "published_text": published_text,
+                        "image": raw_item.get("image") or "",
+                    })
+                return items
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    # Backward compatibility: old snapshots were stored as:
+    # title || url || published_text
+    for raw_line in raw_text.splitlines():
         if " || " not in raw_line:
             continue
         parts = raw_line.split(" || ")
@@ -537,10 +584,11 @@ def parse_link_items_from_snapshot(text):
         items.append({
             "title": clean_item_title(title, published_text) or normalized_url,
             "url": normalized_url,
+            "published": published_text,
             "published_text": published_text,
+            "image": "",
         })
     return items
-
 
 def find_new_link_items(previous_text, current_text):
     previous_items = parse_link_items_from_snapshot(previous_text)
@@ -562,15 +610,16 @@ def build_selected_content(html, selector, base_url, max_chars):
 
     link_items = extract_link_items(elements, base_url)
     if link_items:
+        # Structured snapshot: URL is now the primary comparison unit.
+        # Do not trim this JSON by character count, because truncation would break parsing.
         content_text = serialize_link_items(link_items)
     else:
         raw_text = "\n".join(element.get_text(" ", strip=True) for element in elements)
         content_text = normalize_text(raw_text, max_chars)
+        if max_chars and len(content_text) > max_chars:
+            content_text = content_text[:max_chars]
 
-    if max_chars and len(content_text) > max_chars:
-        content_text = content_text[:max_chars]
     return content_text, link_items
-
 
 def extract_selected_content(html, selector):
     content_text, _link_items = build_selected_content(html, selector, "", 0)
@@ -796,7 +845,7 @@ def build_link_telegram_message(name, source_url, new_items, limit=10):
     item = new_items[0] if new_items else {}
     title = clean_item_title(item.get("title"), item.get("published_text")) or item.get("url") or "Yeni paylaşım"
     item_url = item.get("url") or source_url or ""
-    published_text = item.get("published_text") or ""
+    published_text = item.get("published_text") or item.get("published") or ""
     extra = max(0, len(new_items) - 1)
 
     lines = [
