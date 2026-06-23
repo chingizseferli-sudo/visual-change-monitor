@@ -1,6 +1,7 @@
-import hashlib
+﻿import hashlib
 import os
 import random
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -397,6 +398,68 @@ TRACKING_QUERY_PARAMS = {
 }
 
 
+DATE_TIME_PATTERNS = [
+    re.compile(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+[01]?\d|2[0-3])[:.]\d{2}\b"),
+    re.compile(r"\b(?:[01]?\d|2[0-3])[:.]\d{2}\s+\d{1,2}\s+[A-Za-zƏəĞğİıÖöŞşÜüÇç]+\s+\d{4}\b", re.IGNORECASE),
+    re.compile(r"\b\d{1,2}\s+[A-Za-zƏəĞğİıÖöŞşÜüÇç]+\s+\d{4}(?:\s+(?:[01]?\d|2[0-3])[:.]\d{2})?\b", re.IGNORECASE),
+    re.compile(r"\b(?:[01]?\d|2[0-3])[:.]\d{2}\b"),
+]
+CATEGORY_PREFIXES = {
+    "xəbərlər", "xeberler", "son xəbərlər", "son xeberler", "elanlar", "elan",
+    "vakansiyalar", "vakansiya", "tenderlər", "tenderler", "tender", "report",
+    "gündəm", "gundem", "cəmiyyət", "cemiyyet", "siyasət", "siyaset",
+    "iqtisadiyyat", "idman", "dünya", "dunya", "media", "təhsil", "tehsil",
+}
+
+
+def extract_published_text(text):
+    compact = " ".join((text or "").split())
+    for pattern in DATE_TIME_PATTERNS:
+        match = pattern.search(compact)
+        if match:
+            return match.group(0).replace(".", ":") if re.fullmatch(r"(?:[01]?\d|2[0-3])\.\d{2}", match.group(0)) else match.group(0)
+    return ""
+
+
+def clean_item_title(raw_title, published_text=""):
+    title = " ".join((raw_title or "").split()).strip()
+    if not title:
+        return ""
+
+    if published_text:
+        title = title.replace(published_text, " ")
+
+    for pattern in DATE_TIME_PATTERNS:
+        title = pattern.sub(" ", title)
+
+    title = re.sub(r"\s+[-–—|•·]+\s+", " ", title)
+    title = re.sub(r"^[\s:;,.\-–—|•·]+", "", title)
+    title = re.sub(r"[\s:;,.\-–—|•·]+$", "", title)
+
+    words = title.split()
+    for size in range(min(3, len(words)), 0, -1):
+        prefix = " ".join(words[:size]).casefold()
+        if prefix in CATEGORY_PREFIXES:
+            title = " ".join(words[size:]).strip()
+            break
+    for _ in range(3):
+        parts = re.split(r"\s*[-–—|•·:]+\s*", title, maxsplit=1)
+        if len(parts) != 2:
+            break
+        prefix = parts[0].strip().casefold()
+        if prefix in CATEGORY_PREFIXES or (len(parts[0].strip()) <= 24 and parts[0].strip().isupper()):
+            title = parts[1].strip()
+            continue
+        break
+
+    lines = [line.strip() for line in re.split(r"[\n\r]+", title) if line.strip()]
+    if len(lines) > 1:
+        non_category = [line for line in lines if line.casefold() not in CATEGORY_PREFIXES]
+        if non_category:
+            title = max(non_category, key=len)
+
+    return normalize_text(title, 300)
+
 def normalize_item_url(href, base_url):
     raw = str(href or "").strip()
     if not raw:
@@ -427,16 +490,32 @@ def extract_link_items(elements, base_url):
             absolute_url = normalize_item_url(anchor.get("href"), base_url)
             if not absolute_url or absolute_url in seen:
                 continue
-            title = normalize_text(anchor.get_text(" ", strip=True), 300)
+
+            container = anchor.find_parent(["article", "li"]) or anchor.parent or element
+            container_text = normalize_text(container.get_text(" ", strip=True), 800) if container else ""
+            raw_title = normalize_text(anchor.get_text(" ", strip=True), 500)
+            published_text = extract_published_text(container_text) or extract_published_text(raw_title)
+            title = clean_item_title(raw_title, published_text)
+            if not title:
+                title = clean_item_title(container_text, published_text)
             if not title:
                 title = absolute_url
+
             seen.add(absolute_url)
-            items.append({"title": title, "url": absolute_url})
+            items.append({"title": title, "url": absolute_url, "published_text": published_text})
     return items
 
 
 def serialize_link_items(link_items):
-    return "\n".join(f"{item['title']} || {item['url']}" for item in link_items if item.get("url"))
+    lines = []
+    for item in link_items:
+        if not item.get("url"):
+            continue
+        parts = [item.get("title") or item["url"], item["url"]]
+        if item.get("published_text"):
+            parts.append(item["published_text"])
+        lines.append(" || ".join(parts))
+    return "\n".join(lines)
 
 
 def parse_link_items_from_snapshot(text):
@@ -445,12 +524,21 @@ def parse_link_items_from_snapshot(text):
     for raw_line in (text or "").splitlines():
         if " || " not in raw_line:
             continue
-        title, url = raw_line.rsplit(" || ", 1)
+        parts = raw_line.split(" || ")
+        if len(parts) < 2:
+            continue
+        title = parts[0].strip()
+        url = parts[1].strip()
+        published_text = parts[2].strip() if len(parts) > 2 else ""
         normalized_url = normalize_item_url(url, "")
         if not normalized_url or normalized_url in seen:
             continue
         seen.add(normalized_url)
-        items.append({"title": title.strip() or normalized_url, "url": normalized_url})
+        items.append({
+            "title": clean_item_title(title, published_text) or normalized_url,
+            "url": normalized_url,
+            "published_text": published_text,
+        })
     return items
 
 
@@ -679,7 +767,10 @@ def build_diff_summary(old_text, new_text, noisy=False, max_chars=1200):
 def build_link_diff_summary(new_items, limit=10):
     lines = ["Yeni linklər:"]
     for item in new_items[:limit]:
-        lines.append(f"- {truncate_item(item.get('title'), 220)} — {item.get('url')}")
+        title = clean_item_title(item.get("title"), item.get("published_text")) or item.get("url")
+        published = item.get("published_text") or ""
+        suffix = f" — {published}" if published else ""
+        lines.append(f"- {truncate_item(title, 220)} — {item.get('url')}{suffix}")
     extra = len(new_items) - limit
     if extra > 0:
         lines.append(f"... və {extra} əlavə")
@@ -702,20 +793,34 @@ def build_telegram_message(name, url, diff_summary):
 
 
 def build_link_telegram_message(name, source_url, new_items, limit=10):
+    item = new_items[0] if new_items else {}
+    title = clean_item_title(item.get("title"), item.get("published_text")) or item.get("url") or "Yeni paylaşım"
+    item_url = item.get("url") or source_url or ""
+    published_text = item.get("published_text") or ""
+    extra = max(0, len(new_items) - 1)
+
     lines = [
         "🔔 Yeni paylaşım tapıldı",
         "",
-        f"Mənbə: {name}",
+        "Mənbə:",
+        str(name or "-"),
         "",
-        "Yeni linklər:",
+        "Başlıq:",
+        truncate_item(title, 260),
+        "",
+        "Link:" if item.get("url") else "Bölmə:",
+        str(item_url),
+        "",
     ]
-    for item in new_items[:limit]:
-        lines.append(f"• {truncate_item(item.get('title'), 220)}")
-        lines.append(f"  {item.get('url')}")
-    extra = len(new_items) - limit
+
+    if published_text:
+        lines.extend(["Yayımlanma vaxtı:", published_text])
+    else:
+        lines.extend(["Aşkarlanma vaxtı:", format_baku_time()])
+
     if extra > 0:
-        lines.append(f"... və {extra} əlavə")
-    lines.extend(["", "Bölmə:", str(source_url or ""), "", "Vaxt:", format_baku_time()])
+        lines.extend(["", f"Daha {extra} yeni paylaşım tapıldı."])
+
     return "\n".join(lines)
 
 def success_source_payload(source, content_hash, fetch_result, config, changed=False):
@@ -899,3 +1004,9 @@ def run_loop():
 
 if __name__ == "__main__":
     run_loop()
+
+
+
+
+
+
