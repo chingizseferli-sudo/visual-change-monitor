@@ -5,7 +5,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -384,7 +384,85 @@ def normalize_text(text, max_chars):
     return normalized
 
 
-def extract_selected_content(html, selector):
+TRACKING_QUERY_PARAMS = {
+    "fbclid",
+    "gclid",
+    "mc_cid",
+    "mc_eid",
+    "utm_campaign",
+    "utm_content",
+    "utm_medium",
+    "utm_source",
+    "utm_term",
+}
+
+
+def normalize_item_url(href, base_url):
+    raw = str(href or "").strip()
+    if not raw:
+        return ""
+    absolute = urljoin(base_url or "", raw)
+    parsed = urlparse(absolute)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+
+    query_items = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in TRACKING_QUERY_PARAMS
+    ]
+    query = urlencode(query_items, doseq=True)
+    path = parsed.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    return urlunparse((parsed.scheme, parsed.netloc.lower(), path, parsed.params, query, ""))
+
+
+def extract_link_items(elements, base_url):
+    items = []
+    seen = set()
+    for element in elements:
+        anchors = [element] if getattr(element, "name", None) == "a" and element.get("href") else element.select("a[href]")
+        for anchor in anchors:
+            absolute_url = normalize_item_url(anchor.get("href"), base_url)
+            if not absolute_url or absolute_url in seen:
+                continue
+            title = normalize_text(anchor.get_text(" ", strip=True), 300)
+            if not title:
+                title = absolute_url
+            seen.add(absolute_url)
+            items.append({"title": title, "url": absolute_url})
+    return items
+
+
+def serialize_link_items(link_items):
+    return "\n".join(f"{item['title']} || {item['url']}" for item in link_items if item.get("url"))
+
+
+def parse_link_items_from_snapshot(text):
+    items = []
+    seen = set()
+    for raw_line in (text or "").splitlines():
+        if " || " not in raw_line:
+            continue
+        title, url = raw_line.rsplit(" || ", 1)
+        normalized_url = normalize_item_url(url, "")
+        if not normalized_url or normalized_url in seen:
+            continue
+        seen.add(normalized_url)
+        items.append({"title": title.strip() or normalized_url, "url": normalized_url})
+    return items
+
+
+def find_new_link_items(previous_text, current_text):
+    previous_items = parse_link_items_from_snapshot(previous_text)
+    current_items = parse_link_items_from_snapshot(current_text)
+    previous_urls = {item["url"] for item in previous_items}
+    new_items = [item for item in current_items if item["url"] not in previous_urls]
+    return previous_items, current_items, new_items
+
+
+def build_selected_content(html, selector, base_url, max_chars):
     if not selector or not selector.strip():
         raise ValueError("selector_missing")
     soup = BeautifulSoup(html or "", "lxml")
@@ -393,7 +471,22 @@ def extract_selected_content(html, selector):
     elements = soup.select(selector)
     if not elements:
         raise ValueError("selector_missing")
-    return "\n".join(element.get_text(" ", strip=True) for element in elements)
+
+    link_items = extract_link_items(elements, base_url)
+    if link_items:
+        content_text = serialize_link_items(link_items)
+    else:
+        raw_text = "\n".join(element.get_text(" ", strip=True) for element in elements)
+        content_text = normalize_text(raw_text, max_chars)
+
+    if max_chars and len(content_text) > max_chars:
+        content_text = content_text[:max_chars]
+    return content_text, link_items
+
+
+def extract_selected_content(html, selector):
+    content_text, _link_items = build_selected_content(html, selector, "", 0)
+    return content_text
 
 
 def calculate_hash(content_text):
@@ -577,10 +670,20 @@ def build_diff_summary(old_text, new_text, noisy=False, max_chars=1200):
     ]
     summary = "\n\n".join(section for section in sections if section).strip()
     if not summary:
-        summary = "Mətn dəyişib, amma əlavə/silinən sətrlər ayrıca müəyyənləşdirilə bilmədi."
+        summary = "Mətn dəyişib, amma əlavə/silinən sətirlər ayrıca müəyyənləşdirilə bilmədi."
     if noisy:
         summary = f"{summary}\n\nQeyd: Səhifə tez-tez dəyişə bilər."
     return summary[:max_chars]
+
+
+def build_link_diff_summary(new_items, limit=10):
+    lines = ["Yeni linklər:"]
+    for item in new_items[:limit]:
+        lines.append(f"- {truncate_item(item.get('title'), 220)} — {item.get('url')}")
+    extra = len(new_items) - limit
+    if extra > 0:
+        lines.append(f"... və {extra} əlavə")
+    return "\n".join(lines)
 
 
 def format_baku_time(value=None):
@@ -591,12 +694,29 @@ def format_baku_time(value=None):
 def build_telegram_message(name, url, diff_summary):
     return (
         "🔔 Dəyişiklik aşkarlandı\n\n"
-        f"Mənbə: {name}\n"
-        f"URL: {url}\n\n"
+        f"Mənbə: {name}\n\n"
         f"{diff_summary}\n\n"
-        f"Vaxt: {format_baku_time()}"
+        f"Bölmə:\n{url}\n\n"
+        f"Vaxt:\n{format_baku_time()}"
     )
 
+
+def build_link_telegram_message(name, source_url, new_items, limit=10):
+    lines = [
+        "🔔 Yeni paylaşım tapıldı",
+        "",
+        f"Mənbə: {name}",
+        "",
+        "Yeni linklər:",
+    ]
+    for item in new_items[:limit]:
+        lines.append(f"• {truncate_item(item.get('title'), 220)}")
+        lines.append(f"  {item.get('url')}")
+    extra = len(new_items) - limit
+    if extra > 0:
+        lines.append(f"... və {extra} əlavə")
+    lines.extend(["", "Bölmə:", str(source_url or ""), "", "Vaxt:", format_baku_time()])
+    return "\n".join(lines)
 
 def success_source_payload(source, content_hash, fetch_result, config, changed=False):
     payload = {
@@ -644,15 +764,19 @@ def check_source(source, config, domain_limiter):
             print(f"No change (304): {name}", flush=True)
             return
 
-        raw_content = extract_selected_content(fetch_result["html"], source.get("selector"))
-        content_text = normalize_text(raw_content, config["snapshot_text_max_chars"])
+        content_text, link_items = build_selected_content(
+            fetch_result["html"],
+            source.get("selector"),
+            source.get("url"),
+            config["snapshot_text_max_chars"],
+        )
         if not content_text:
             raise ValueError("empty_content")
         new_hash = calculate_hash(content_text)
         old_hash = source.get("content_hash")
         hash_state = hash_diagnostic_state(source, old_hash, new_hash)
         print(
-            f"Selector extracted: {name} | selector={source.get('selector')} | chars={len(content_text)} | hash_state={hash_state} | hash={new_hash[:12]}",
+            f"Selector extracted: {name} | selector={source.get('selector')} | chars={len(content_text)} | link_items_found={len(link_items)} | hash_state={hash_state} | hash={new_hash[:12]}",
             flush=True,
         )
 
@@ -695,7 +819,16 @@ def check_source(source, config, domain_limiter):
             config,
         )
         previous_text = latest_snapshot.get("content_text") if latest_snapshot else ""
-        diff_summary = build_diff_summary(previous_text or "", content_text, noisy=hash_state == "possible_noisy_page")
+        previous_link_items, current_link_items, new_link_items = find_new_link_items(previous_text or "", content_text)
+        fallback_text_diff = not new_link_items
+        print(
+            f"Link diff: {name} | previous_link_count={len(previous_link_items)} | current_link_count={len(current_link_items)} | new_link_count={len(new_link_items)} | fallback_text_diff={fallback_text_diff}",
+            flush=True,
+        )
+        if new_link_items:
+            diff_summary = build_link_diff_summary(new_link_items)
+        else:
+            diff_summary = build_diff_summary(previous_text or "", content_text, noisy=hash_state == "possible_noisy_page")
         event = insert_change_event(
             source_id,
             latest_snapshot.get("id") if latest_snapshot else None,
@@ -708,7 +841,11 @@ def check_source(source, config, domain_limiter):
         chat_id = source.get("telegram_chat_id") or config["default_chat_id"]
         alert = insert_alert(event.get("id") if event else None, source_id, chat_id, config)
 
-        message = build_telegram_message(name, source.get("url"), diff_summary)
+        message = (
+            build_link_telegram_message(name, source.get("url"), new_link_items)
+            if new_link_items
+            else build_telegram_message(name, source.get("url"), diff_summary)
+        )
         ok, error = send_telegram(config, chat_id, message)
         if ok:
             update_alert(alert.get("id") if alert else None, {"status": "sent", "sent_at": iso_now(), "error": None}, config)
