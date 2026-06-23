@@ -93,12 +93,12 @@ def supabase_headers(config, extra=None):
     return headers
 
 
-def supabase_request(method, path, config, params=None, json=None):
+def supabase_request(method, path, config, params=None, json=None, extra_headers=None):
     url = f"{config['supabase_url']}/rest/v1/{path.lstrip('/')}"
     response = requests.request(
         method,
         url,
-        headers=supabase_headers(config),
+        headers=supabase_headers(config, extra_headers),
         params=params,
         json=json,
         timeout=config["request_timeout_seconds"],
@@ -108,6 +108,12 @@ def supabase_request(method, path, config, params=None, json=None):
     if not response.text:
         return None
     return response.json()
+
+
+def require_inserted_row(rows, table_name, source_id):
+    if rows and isinstance(rows, list) and rows[0].get("id"):
+        return rows[0]
+    raise RuntimeError(f"Supabase insert returned no id: {table_name} | source={source_id} | rows={rows}")
 
 
 def get_domain(url):
@@ -262,8 +268,11 @@ def insert_snapshot(source_id, content_text, content_hash, response_status, resp
         config,
         params={"select": "id"},
         json=payload,
+        extra_headers={"Prefer": "return=representation"},
     )
-    return rows[0] if rows else None
+    snapshot = require_inserted_row(rows, "change_snapshots", source_id)
+    print(f"Snapshot inserted: {source_id} | snapshot={snapshot.get('id')}", flush=True)
+    return snapshot
 
 
 def get_latest_snapshot(source_id, config):
@@ -300,8 +309,9 @@ def insert_change_event(source_id, old_snapshot_id, new_snapshot_id, old_hash, n
         config,
         params={"select": "id,created_at"},
         json=payload,
+        extra_headers={"Prefer": "return=representation"},
     )
-    return rows[0] if rows else None
+    return require_inserted_row(rows, "change_events", source_id)
 
 
 def insert_alert(event_id, source_id, telegram_chat_id, config):
@@ -321,8 +331,9 @@ def insert_alert(event_id, source_id, telegram_chat_id, config):
         config,
         params={"select": "id"},
         json=payload,
+        extra_headers={"Prefer": "return=representation"},
     )
-    return rows[0] if rows else None
+    return require_inserted_row(rows, "change_alerts", source_id)
 
 
 def update_alert(alert_id, payload, config):
