@@ -359,6 +359,7 @@ def fetch_source(source, config):
     if source.get("last_modified"):
         headers["If-Modified-Since"] = source["last_modified"]
 
+    print(f"Fetch started: {source.get('name') or url} | {url}", flush=True)
     started = time.monotonic()
     try:
         response = requests.get(
@@ -374,6 +375,10 @@ def fetch_source(source, config):
 
     response_time_ms = int((time.monotonic() - started) * 1000)
     status = response.status_code
+    print(
+        f"Fetch completed: {source.get('name') or url} | status={status} | time={response_time_ms}ms",
+        flush=True,
+    )
     if status == 304:
         return {
             "status": 304,
@@ -467,8 +472,14 @@ def check_source(source, config, domain_limiter):
             raise ValueError("empty_content")
         new_hash = calculate_hash(content_text)
         old_hash = source.get("content_hash")
+        print(
+            f"Selector extracted: {name} | selector={source.get('selector')} | chars={len(content_text)} | hash={new_hash[:12]}",
+            flush=True,
+        )
 
         if not old_hash:
+            if config["dry_run"]:
+                print(f"[DRY_RUN] baseline would be created: {name} | hash={new_hash[:12]}", flush=True)
             snapshot = insert_snapshot(
                 source_id,
                 content_text,
@@ -483,11 +494,15 @@ def check_source(source, config, domain_limiter):
             return
 
         if new_hash == old_hash:
+            if config["dry_run"]:
+                print(f"[DRY_RUN] no-change source update would be written: {name}", flush=True)
             payload = success_source_payload(source, new_hash, fetch_result, config)
             update_source(source_id, payload, config)
             print(f"No change: {name}", flush=True)
             return
 
+        if config["dry_run"]:
+            print(f"[DRY_RUN] change would be recorded: {name} | old={str(old_hash)[:12]} | new={new_hash[:12]}", flush=True)
         latest_snapshot = get_latest_snapshot(source_id, config)
         new_snapshot = insert_snapshot(
             source_id,
