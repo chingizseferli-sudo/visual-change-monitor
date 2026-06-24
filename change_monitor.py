@@ -290,6 +290,28 @@ def get_latest_snapshot(source_id, config):
     return rows[0] if rows else None
 
 
+def get_seen_link_urls(source_id, config, limit=100):
+    rows = supabase_request(
+        "GET",
+        "change_snapshots",
+        config,
+        params={
+            "select": "id,content_text,captured_at",
+            "source_id": f"eq.{source_id}",
+            "order": "captured_at.desc",
+            "limit": str(limit),
+        },
+    ) or []
+
+    seen_urls = set()
+    for row in rows:
+        for item in parse_link_items_from_snapshot(row.get("content_text") or ""):
+            url = normalize_item_url(item.get("url"), "")
+            if url:
+                seen_urls.add(url)
+    return seen_urls
+
+
 def insert_change_event(source_id, old_snapshot_id, new_snapshot_id, old_hash, new_hash, diff_summary, config):
     payload = {
         "source_id": source_id,
@@ -1084,6 +1106,19 @@ def check_source(source, config, domain_limiter):
                 flush=True,
             )
         latest_snapshot = get_latest_snapshot(source_id, config)
+        previous_text = latest_snapshot.get("content_text") if latest_snapshot else ""
+        previous_link_items, current_link_items, new_link_items = find_new_link_items(previous_text or "", content_text)
+        seen_link_urls = get_seen_link_urls(source_id, config) if current_link_items else set()
+        first_seen_new_link_items = [
+            item for item in new_link_items
+            if normalize_item_url(item.get("url"), "") not in seen_link_urls
+        ]
+        fallback_text_diff = not first_seen_new_link_items
+        print(
+            f"Link diff: {name} | previous_link_count={len(previous_link_items)} | current_link_count={len(current_link_items)} | new_link_count={len(new_link_items)} | first_seen_new_link_count={len(first_seen_new_link_items)} | seen_history_count={len(seen_link_urls)} | fallback_text_diff={fallback_text_diff}",
+            flush=True,
+        )
+
         new_snapshot = insert_snapshot(
             source_id,
             content_text,
@@ -1092,18 +1127,15 @@ def check_source(source, config, domain_limiter):
             fetch_result["response_time_ms"],
             config,
         )
-        previous_text = latest_snapshot.get("content_text") if latest_snapshot else ""
-        previous_link_items, current_link_items, new_link_items = find_new_link_items(previous_text or "", content_text)
-        fallback_text_diff = not new_link_items
-        print(
-            f"Link diff: {name} | previous_link_count={len(previous_link_items)} | current_link_count={len(current_link_items)} | new_link_count={len(new_link_items)} | fallback_text_diff={fallback_text_diff}",
-            flush=True,
-        )
-        if new_link_items:
-            diff_summary = build_link_diff_summary(new_link_items)
-        elif current_link_items:
-            # Structured snapshots are JSON internally; never send raw JSON as a user-facing diff.
-            diff_summary = build_link_diff_summary(current_link_items[:1])
+
+        if current_link_items and not first_seen_new_link_items:
+            payload = success_source_payload(source, new_hash, fetch_result, config)
+            update_source(source_id, payload, config)
+            print(f"No first-seen link change: {name} | snapshot={new_snapshot.get('id') if new_snapshot else None}", flush=True)
+            return
+
+        if first_seen_new_link_items:
+            diff_summary = build_link_diff_summary(first_seen_new_link_items)
         else:
             diff_summary = build_diff_summary(previous_text or "", content_text, noisy=hash_state == "possible_noisy_page")
         event = insert_change_event(
@@ -1118,7 +1150,7 @@ def check_source(source, config, domain_limiter):
         chat_id = source.get("telegram_chat_id") or config["default_chat_id"]
         alert = insert_alert(event.get("id") if event else None, source_id, chat_id, config)
 
-        telegram_items = new_link_items or current_link_items
+        telegram_items = first_seen_new_link_items
         message = (
             build_link_telegram_message(name, source.get("url"), telegram_items)
             if telegram_items
