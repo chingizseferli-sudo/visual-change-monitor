@@ -446,8 +446,110 @@ def extract_published_text(text):
     return ""
 
 
+def parse_published_datetime(value):
+    raw = " ".join((value or "").split()).strip()
+    if not raw:
+        return None
+
+    month_map = {
+        "yanvar": 1, "fevral": 2, "mart": 3, "aprel": 4, "may": 5, "iyun": 6,
+        "iyul": 7, "avqust": 8, "sentyabr": 9, "oktyabr": 10, "noyabr": 11, "dekabr": 12,
+        "january": 1, "february": 2, "march": 3, "april": 4, "june": 6, "july": 7,
+        "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+
+    iso_numeric = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+([01]?\d|2[0-3])[:.](\d{2}))?\b", raw)
+    if iso_numeric:
+        year, month, day = int(iso_numeric.group(1)), int(iso_numeric.group(2)), int(iso_numeric.group(3))
+        hour = int(iso_numeric.group(4) or 0)
+        minute = int(iso_numeric.group(5) or 0)
+        try:
+            return datetime(year, month, day, hour, minute, tzinfo=timezone(timedelta(hours=4)))
+        except ValueError:
+            return None
+
+    numeric = re.search(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})(?:\s+([01]?\d|2[0-3])[:.](\d{2}))?\b", raw)
+    if numeric:
+        day, month, year = int(numeric.group(1)), int(numeric.group(2)), int(numeric.group(3))
+        if year < 100:
+            year += 2000
+        hour = int(numeric.group(4) or 0)
+        minute = int(numeric.group(5) or 0)
+        try:
+            return datetime(year, month, day, hour, minute, tzinfo=timezone(timedelta(hours=4)))
+        except ValueError:
+            return None
+
+    word = re.search(
+        r"\b(\d{1,2})\s+([A-Za-zƏəĞğİıÖöŞşÜüÇç]+)\s+(\d{4})(?:\s+([01]?\d|2[0-3])[:.](\d{2}))?\b",
+        raw,
+        re.IGNORECASE,
+    )
+    if word:
+        month = month_map.get(word.group(2).casefold())
+        if not month:
+            return None
+        hour = int(word.group(4) or 0)
+        minute = int(word.group(5) or 0)
+        try:
+            return datetime(int(word.group(3)), month, int(word.group(1)), hour, minute, tzinfo=timezone(timedelta(hours=4)))
+        except ValueError:
+            return None
+
+    return None
+
+
+def is_old_published_item(published_text, max_age_days=3):
+    published_dt = parse_published_datetime(published_text)
+    if not published_dt:
+        return False
+    return utc_now() - published_dt.astimezone(UTC) > timedelta(days=max_age_days)
+
+
+def strip_diff_labels(text):
+    cleaned = " ".join((text or "").split()).strip()
+    cleaned = re.sub(r"^(Yeni əlavə olunanlar|Yeni elave olunanlar|Silinənlər|Silinenler|Yeni linklər|Yeni linkler)\s*[:：\-–—]*\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(Silinənlər|Silinenler)\s*[:：\-–—].*$", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def best_title_candidate(anchor, container, published_text):
+    candidates = []
+    for attr in ("data-title", "aria-label", "title"):
+        value = anchor.get(attr) if anchor else ""
+        if value:
+            candidates.append(value)
+
+    if anchor:
+        heading = anchor.find(["h1", "h2", "h3", "h4", "h5"])
+        if heading:
+            candidates.append(heading.get_text(" ", strip=True))
+        candidates.append(anchor.get_text(" ", strip=True))
+
+    if container:
+        for selector in ["h1", "h2", "h3", "h4", ".title", ".news-title", ".post-title", "[class*='title']"]:
+            found = container.select_one(selector) if hasattr(container, "select_one") else None
+            if found:
+                candidates.append(found.get_text(" ", strip=True))
+
+    cleaned = []
+    for candidate in candidates:
+        title = clean_item_title(strip_diff_labels(candidate), published_text)
+        if is_telegram_title_usable(title):
+            cleaned.append(title)
+
+    if cleaned:
+        return max(cleaned, key=len)
+
+    for candidate in candidates:
+        title = clean_item_title(strip_diff_labels(candidate), published_text)
+        if title:
+            return title
+    return ""
+
+
 def clean_item_title(raw_title, published_text=""):
-    title = " ".join((raw_title or "").split()).strip()
+    title = strip_diff_labels(" ".join((raw_title or "").split()).strip())
     if not title:
         return ""
 
@@ -457,6 +559,7 @@ def clean_item_title(raw_title, published_text=""):
     for pattern in DATE_TIME_PATTERNS:
         title = pattern.sub(" ", title)
 
+    title = re.sub(r"\b\d{3,}\b", " ", title)
     title = re.sub(r"\s+[-–—|•·]+\s+", " ", title)
     title = re.sub(r"^[\s:;,.\-–—|•·]+", "", title)
     title = re.sub(r"[\s:;,.\-–—|•·]+$", "", title)
@@ -483,7 +586,12 @@ def clean_item_title(raw_title, published_text=""):
         if non_category:
             title = max(non_category, key=len)
 
-    return normalize_text(title, 300)
+    title = normalize_text(title, 300)
+    if len(title) > 180:
+        sentence_parts = re.split(r"(?<=[.!?])\s+", title)
+        if sentence_parts and 20 <= len(sentence_parts[0]) <= 180:
+            title = sentence_parts[0]
+    return title
 
 def normalize_item_url(href, base_url):
     raw = str(href or "").strip()
@@ -550,13 +658,15 @@ def extract_link_items(elements, base_url):
             if not absolute_url or absolute_url in seen:
                 continue
 
-            container = anchor.find_parent(["article", "li"]) or anchor.parent or element
+            container = anchor.find_parent(["article", "li", "div", "section"]) or anchor.parent or element
             container_text = normalize_text(container.get_text(" ", strip=True), 800) if container else ""
             raw_title = normalize_text(anchor.get_text(" ", strip=True), 500)
             published_text = extract_published_text(container_text) or extract_published_text(raw_title)
-            title = clean_item_title(raw_title, published_text)
+            title = best_title_candidate(anchor, container, published_text)
             if not title:
-                title = clean_item_title(container_text, published_text)
+                title = clean_item_title(raw_title, published_text)
+            if is_old_published_item(published_text):
+                continue
             if not is_probable_content_link(title, absolute_url, base_url):
                 continue
 
@@ -893,7 +1003,7 @@ def format_baku_time(value=None):
 
 
 def is_telegram_title_usable(title, url=""):
-    title = clean_item_title(title, "")
+    title = clean_item_title(strip_diff_labels(title), "")
     if not title:
         return False
     if title == url:
@@ -905,7 +1015,8 @@ def is_telegram_title_usable(title, url=""):
         return False
     if title.casefold() in CATEGORY_PREFIXES:
         return False
-    if title.startswith("{") or '"items"' in title or "Yeni linklər:" in title:
+    technical_markers = ["{", '"items"', "Yeni linklər:", "Yeni əlavə olunanlar", "Silinənlər", "Silinenler"]
+    if any(marker in title for marker in technical_markers):
         return False
     return True
 
@@ -944,17 +1055,19 @@ def sanitize_telegram_summary(summary):
 
 
 def build_telegram_message(name, url, diff_summary):
+    # Text-only changes do not have a reliable article title. Never expose raw
+    # diff sections such as "Yeni əlavə olunanlar" or "Silinənlər" as a title.
     summary = sanitize_telegram_summary(diff_summary)
     return f"""
 🆕 Yeni paylaşım
 
 📌 Başlıq:
-{truncate_item(summary, 260)}
+{truncate_item(summary, 180)}
 
 🌐 Mənbə:
 {name or '-'}
 
-🕒 Tarix və saat:
+🕒 Aşkarlanma vaxtı:
 {format_baku_time()}
 
 🔗 Link:
@@ -963,23 +1076,26 @@ def build_telegram_message(name, url, diff_summary):
 
 
 def build_link_telegram_message(name, source_url, new_items, limit=10):
-    item = pick_telegram_item(new_items)
+    fresh_items = [item for item in (new_items or []) if not is_old_published_item(item.get("published_text") or item.get("published") or "")]
+    item = pick_telegram_item(fresh_items)
     title = clean_item_title(item.get("title"), item.get("published_text")) or "Seçilmiş hissədə dəyişiklik var"
     item_url = item.get("url") or source_url or ""
-    published_text = item.get("published_text") or item.get("published") or format_baku_time()
-    extra = max(0, len(new_items or []) - 1)
+    published_text = item.get("published_text") or item.get("published") or ""
+    extra = max(0, len(fresh_items) - 1)
+    time_label = "Saytda yayımlandığı tarix" if published_text else "Aşkarlanma vaxtı"
+    time_value = published_text or format_baku_time()
 
     message = f"""
 🆕 Yeni paylaşım
 
 📌 Başlıq:
-{truncate_item(title, 260)}
+{truncate_item(title, 220)}
 
 🌐 Mənbə:
 {name or '-'}
 
-🕒 Tarix və saat:
-{published_text or '-'}
+🕒 {time_label}:
+{time_value or '-'}
 
 🔗 Link:
 {item_url or '-'}
@@ -989,7 +1105,6 @@ def build_link_telegram_message(name, source_url, new_items, limit=10):
         message += f"\n\nDaha {extra} yeni paylaşım tapıldı."
 
     return message
-
 
 def success_source_payload(source, content_hash, fetch_result, config, changed=False):
     payload = {
@@ -1134,10 +1249,20 @@ def check_source(source, config, domain_limiter):
             print(f"No first-seen link change: {name} | snapshot={new_snapshot.get('id') if new_snapshot else None}", flush=True)
             return
 
-        if first_seen_new_link_items:
-            diff_summary = build_link_diff_summary(first_seen_new_link_items)
+        fresh_first_seen_link_items = [
+            item for item in first_seen_new_link_items
+            if not is_old_published_item(item.get("published_text") or item.get("published") or "")
+        ]
+        if first_seen_new_link_items and not fresh_first_seen_link_items:
+            payload = success_source_payload(source, new_hash, fetch_result, config)
+            update_source(source_id, payload, config)
+            print(f"Only old dated links changed: {name} | snapshot={new_snapshot.get('id') if new_snapshot else None}", flush=True)
+            return
+
+        if fresh_first_seen_link_items:
+            diff_summary = build_link_diff_summary(fresh_first_seen_link_items)
         else:
-            diff_summary = build_diff_summary(previous_text or "", content_text, noisy=hash_state == "possible_noisy_page")
+            diff_summary = "Seçilmiş hissədə dəyişiklik var."
         event = insert_change_event(
             source_id,
             latest_snapshot.get("id") if latest_snapshot else None,
@@ -1150,7 +1275,7 @@ def check_source(source, config, domain_limiter):
         chat_id = source.get("telegram_chat_id") or config["default_chat_id"]
         alert = insert_alert(event.get("id") if event else None, source_id, chat_id, config)
 
-        telegram_items = first_seen_new_link_items
+        telegram_items = fresh_first_seen_link_items
         message = (
             build_link_telegram_message(name, source.get("url"), telegram_items)
             if telegram_items
