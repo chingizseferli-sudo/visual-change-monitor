@@ -836,48 +836,50 @@ def format_baku_time(value=None):
 
 def build_telegram_message(name, url, diff_summary):
     summary = clean_item_title(diff_summary, "") or "Seçilmiş hissədə dəyişiklik var"
-    return (
-        "🔔 Dəyişiklik aşkarlandı\n\n"
-        "Mənbə:\n"
-        f"{name or '-'}\n\n"
-        "Başlıq:\n"
-        f"{truncate_item(summary, 260)}\n\n"
-        "Saytda yayımlandığı tarix:\n"
-        "-\n\n"
-        "Link:\n"
-        f"{url or '-'}\n\n"
-        "Aşkarlanma vaxtı:\n"
-        f"{format_baku_time()}"
-    )
+    return f"""
+Yeni paylaşım
+
+Başlıq:
+{truncate_item(summary, 260)}
+
+Mənbə:
+{name or '-'}
+
+Tarix və saat:
+{format_baku_time()}
+
+Link:
+{url or '-'}
+""".strip()
 
 
 def build_link_telegram_message(name, source_url, new_items, limit=10):
     item = new_items[0] if new_items else {}
     title = clean_item_title(item.get("title"), item.get("published_text")) or item.get("url") or "Yeni paylaşım"
     item_url = item.get("url") or source_url or ""
-    published_text = item.get("published_text") or item.get("published") or "-"
+    published_text = item.get("published_text") or item.get("published") or format_baku_time()
     extra = max(0, len(new_items) - 1)
 
-    lines = [
-        "🔔 Yeni paylaşım tapıldı",
-        "",
-        "Mənbə:",
-        str(name or "-"),
-        "",
-        "Başlıq:",
-        truncate_item(title, 260),
-        "",
-        "Saytda yayımlandığı tarix:",
-        str(published_text or "-"),
-        "",
-        "Link:",
-        str(item_url or "-"),
-    ]
+    message = f"""
+Yeni paylaşım
+
+Başlıq:
+{truncate_item(title, 260)}
+
+Mənbə:
+{name or '-'}
+
+Tarix və saat:
+{published_text or '-'}
+
+Link:
+{item_url or '-'}
+""".strip()
 
     if extra > 0:
-        lines.extend(["", f"Daha {extra} yeni paylaşım tapıldı."])
+        message += f"\n\nDaha {extra} yeni paylaşım tapıldı."
 
-    return "\n".join(lines)
+    return message
 
 
 def success_source_payload(source, content_hash, fetch_result, config, changed=False):
@@ -1088,9 +1090,3 @@ def run_loop():
 
 if __name__ == "__main__":
     run_loop()
-
-
-
-
-
-
