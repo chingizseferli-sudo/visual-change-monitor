@@ -690,7 +690,7 @@ class DomainLimiter:
             time.sleep(wait_for)
 
 
-def fetch_source(source, config):
+def fetch_source(source, config, force_full=False):
     url = str(source.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
         raise ValueError("invalid_url")
@@ -699,9 +699,9 @@ def fetch_source(source, config):
         "User-Agent": config["user_agent"],
         "Accept": "text/html,application/xhtml+xml",
     }
-    if source.get("etag"):
+    if not force_full and source.get("etag"):
         headers["If-None-Match"] = source["etag"]
-    if source.get("last_modified"):
+    if not force_full and source.get("last_modified"):
         headers["If-Modified-Since"] = source["last_modified"]
 
     print(f"Fetch started: {source.get('name') or url} | {url}", flush=True)
@@ -914,10 +914,16 @@ def check_source(source, config, domain_limiter):
         fetch_result = fetch_source(source, config)
 
         if fetch_result["status"] == 304:
-            payload = success_source_payload(source, source.get("content_hash"), fetch_result, config)
-            update_source(source_id, payload, config)
-            print(f"No change (304): {name}", flush=True)
-            return
+            latest_snapshot = get_latest_snapshot(source_id, config)
+            if source.get("content_hash") and not latest_snapshot:
+                print(f"Snapshot missing after 304: {name} | retrying full fetch for recovery baseline", flush=True)
+                uncached_source = {**source, "etag": None, "last_modified": None}
+                fetch_result = fetch_source(uncached_source, config, force_full=True)
+            else:
+                payload = success_source_payload(source, source.get("content_hash"), fetch_result, config)
+                update_source(source_id, payload, config)
+                print(f"No change (304): {name}", flush=True)
+                return
 
         content_text, link_items = build_selected_content(
             fetch_result["html"],
@@ -952,6 +958,23 @@ def check_source(source, config, domain_limiter):
             return
 
         if new_hash == old_hash:
+            latest_snapshot = get_latest_snapshot(source_id, config)
+            if not latest_snapshot:
+                if config["dry_run"]:
+                    print(f"[DRY_RUN] recovery baseline would be created: {name} | hash_state=unchanged | hash={new_hash[:12]}", flush=True)
+                snapshot = insert_snapshot(
+                    source_id,
+                    content_text,
+                    new_hash,
+                    fetch_result["status"],
+                    fetch_result["response_time_ms"],
+                    config,
+                )
+                payload = success_source_payload(source, new_hash, fetch_result, config)
+                update_source(source_id, payload, config)
+                print(f"Recovery baseline created: {name} | snapshot={snapshot.get('id') if snapshot else None}", flush=True)
+                return
+
             if config["dry_run"]:
                 print(f"[DRY_RUN] no-change source update would be written: {name} | hash_state=unchanged", flush=True)
             payload = success_source_payload(source, new_hash, fetch_result, config)
