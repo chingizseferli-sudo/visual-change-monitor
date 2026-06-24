@@ -363,7 +363,9 @@ def send_telegram(config, chat_id, text):
         json={
             "chat_id": chat_id,
             "text": text,
-            "disable_web_page_preview": True,
+            # Keep Telegram's native link preview enabled so the URL appears as a
+            # normal clickable card with title/image when the target page provides it.
+            "disable_web_page_preview": False,
         },
         timeout=config["request_timeout_seconds"],
     )
@@ -833,12 +835,19 @@ def format_baku_time(value=None):
 
 
 def build_telegram_message(name, url, diff_summary):
+    summary = clean_item_title(diff_summary, "") or "Seçilmiş hissədə dəyişiklik var"
     return (
         "🔔 Dəyişiklik aşkarlandı\n\n"
-        f"Mənbə: {name}\n\n"
-        f"{diff_summary}\n\n"
-        f"Bölmə:\n{url}\n\n"
-        f"Vaxt:\n{format_baku_time()}"
+        "Mənbə:\n"
+        f"{name or '-'}\n\n"
+        "Başlıq:\n"
+        f"{truncate_item(summary, 260)}\n\n"
+        "Saytda yayımlandığı tarix:\n"
+        "-\n\n"
+        "Link:\n"
+        f"{url or '-'}\n\n"
+        "Aşkarlanma vaxtı:\n"
+        f"{format_baku_time()}"
     )
 
 
@@ -846,7 +855,7 @@ def build_link_telegram_message(name, source_url, new_items, limit=10):
     item = new_items[0] if new_items else {}
     title = clean_item_title(item.get("title"), item.get("published_text")) or item.get("url") or "Yeni paylaşım"
     item_url = item.get("url") or source_url or ""
-    published_text = item.get("published_text") or item.get("published") or ""
+    published_text = item.get("published_text") or item.get("published") or "-"
     extra = max(0, len(new_items) - 1)
 
     lines = [
@@ -858,20 +867,18 @@ def build_link_telegram_message(name, source_url, new_items, limit=10):
         "Başlıq:",
         truncate_item(title, 260),
         "",
-        "Link:" if item.get("url") else "Bölmə:",
-        str(item_url),
+        "Saytda yayımlandığı tarix:",
+        str(published_text or "-"),
         "",
+        "Link:",
+        str(item_url or "-"),
     ]
-
-    if published_text:
-        lines.extend(["Yayımlanma vaxtı:", published_text])
-    else:
-        lines.extend(["Aşkarlanma vaxtı:", format_baku_time()])
 
     if extra > 0:
         lines.extend(["", f"Daha {extra} yeni paylaşım tapıldı."])
 
     return "\n".join(lines)
+
 
 def success_source_payload(source, content_hash, fetch_result, config, changed=False):
     payload = {
@@ -1005,6 +1012,9 @@ def check_source(source, config, domain_limiter):
         )
         if new_link_items:
             diff_summary = build_link_diff_summary(new_link_items)
+        elif current_link_items:
+            # Structured snapshots are JSON internally; never send raw JSON as a user-facing diff.
+            diff_summary = build_link_diff_summary(current_link_items[:1])
         else:
             diff_summary = build_diff_summary(previous_text or "", content_text, noisy=hash_state == "possible_noisy_page")
         event = insert_change_event(
@@ -1019,9 +1029,10 @@ def check_source(source, config, domain_limiter):
         chat_id = source.get("telegram_chat_id") or config["default_chat_id"]
         alert = insert_alert(event.get("id") if event else None, source_id, chat_id, config)
 
+        telegram_items = new_link_items or (current_link_items[:1] if current_link_items else [])
         message = (
-            build_link_telegram_message(name, source.get("url"), new_link_items)
-            if new_link_items
+            build_link_telegram_message(name, source.get("url"), telegram_items)
+            if telegram_items
             else build_telegram_message(name, source.get("url"), diff_summary)
         )
         ok, error = send_telegram(config, chat_id, message)
