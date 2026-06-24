@@ -834,45 +834,96 @@ def format_baku_time(value=None):
     return dt.astimezone(timezone(timedelta(hours=4))).strftime("%d.%m.%Y %H:%M")
 
 
-def build_telegram_message(name, url, diff_summary):
-    summary = clean_item_title(diff_summary, "") or "Seçilmiş hissədə dəyişiklik var"
-    return f"""
-Yeni paylaşım
+def is_telegram_title_usable(title, url=""):
+    title = clean_item_title(title, "")
+    if not title:
+        return False
+    if title == url:
+        return False
+    if len(title) < 8:
+        return False
+    compact = re.sub(r"\W+", "", title, flags=re.UNICODE)
+    if not compact or compact.isdigit():
+        return False
+    if title.casefold() in CATEGORY_PREFIXES:
+        return False
+    if title.startswith("{") or '"items"' in title or "Yeni linklər:" in title:
+        return False
+    return True
 
-Başlıq:
+
+def pick_telegram_item(items):
+    usable = []
+    fallback = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url") or ""
+        if not url:
+            continue
+        title = clean_item_title(item.get("title"), item.get("published_text") or item.get("published") or "")
+        normalized = {
+            **item,
+            "title": title or url,
+            "url": url,
+            "published_text": item.get("published_text") or item.get("published") or "",
+            "published": item.get("published") or item.get("published_text") or "",
+        }
+        if is_telegram_title_usable(title, url):
+            usable.append(normalized)
+        else:
+            fallback.append(normalized)
+    if usable:
+        return usable[0]
+    return fallback[0] if fallback else {}
+
+
+def sanitize_telegram_summary(summary):
+    clean = clean_item_title(summary, "")
+    if not is_telegram_title_usable(clean):
+        return "Seçilmiş hissədə dəyişiklik var"
+    return clean
+
+
+def build_telegram_message(name, url, diff_summary):
+    summary = sanitize_telegram_summary(diff_summary)
+    return f"""
+🆕 Yeni paylaşım
+
+📌 Başlıq:
 {truncate_item(summary, 260)}
 
-Mənbə:
+🌐 Mənbə:
 {name or '-'}
 
-Tarix və saat:
+🕒 Tarix və saat:
 {format_baku_time()}
 
-Link:
+🔗 Link:
 {url or '-'}
 """.strip()
 
 
 def build_link_telegram_message(name, source_url, new_items, limit=10):
-    item = new_items[0] if new_items else {}
-    title = clean_item_title(item.get("title"), item.get("published_text")) or item.get("url") or "Yeni paylaşım"
+    item = pick_telegram_item(new_items)
+    title = clean_item_title(item.get("title"), item.get("published_text")) or "Seçilmiş hissədə dəyişiklik var"
     item_url = item.get("url") or source_url or ""
     published_text = item.get("published_text") or item.get("published") or format_baku_time()
-    extra = max(0, len(new_items) - 1)
+    extra = max(0, len(new_items or []) - 1)
 
     message = f"""
-Yeni paylaşım
+🆕 Yeni paylaşım
 
-Başlıq:
+📌 Başlıq:
 {truncate_item(title, 260)}
 
-Mənbə:
+🌐 Mənbə:
 {name or '-'}
 
-Tarix və saat:
+🕒 Tarix və saat:
 {published_text or '-'}
 
-Link:
+🔗 Link:
 {item_url or '-'}
 """.strip()
 
@@ -1031,7 +1082,7 @@ def check_source(source, config, domain_limiter):
         chat_id = source.get("telegram_chat_id") or config["default_chat_id"]
         alert = insert_alert(event.get("id") if event else None, source_id, chat_id, config)
 
-        telegram_items = new_link_items or (current_link_items[:1] if current_link_items else [])
+        telegram_items = new_link_items or current_link_items
         message = (
             build_link_telegram_message(name, source.get("url"), telegram_items)
             if telegram_items
