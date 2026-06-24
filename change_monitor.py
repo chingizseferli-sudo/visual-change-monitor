@@ -484,6 +484,40 @@ def normalize_item_url(href, base_url):
     return urlunparse((parsed.scheme, parsed.netloc.lower(), path, parsed.params, query, ""))
 
 
+IGNORED_LINK_TITLES = {
+    "daha ətraflı", "daha etrafli", "ətraflı", "etrafli", "read more",
+    "more", "next", "previous", "növbəti", "novbeti", "əvvəlki", "evvelki",
+    "hamısı", "hamisi", "bütün xəbərlər", "butun xeberler",
+}
+
+
+def is_probable_content_link(title, url, base_url=""):
+    clean = clean_item_title(title, "")
+    if not clean or not url:
+        return False
+    if clean == url:
+        return False
+
+    lowered = clean.casefold()
+    if lowered in CATEGORY_PREFIXES or lowered in IGNORED_LINK_TITLES:
+        return False
+
+    compact = re.sub(r"\W+", "", clean, flags=re.UNICODE)
+    if not compact or compact.isdigit():
+        return False
+
+    # Pagination, counters and tiny menu labels are not monitored posts.
+    if len(compact) < 8:
+        return False
+
+    parsed = urlparse(url)
+    base = urlparse(normalize_item_url(base_url, "")) if base_url else None
+    if base and parsed.netloc == base.netloc and (parsed.path or "/") == (base.path or "/"):
+        return False
+
+    return True
+
+
 def extract_link_items(elements, base_url):
     items = []
     seen = set()
@@ -501,8 +535,8 @@ def extract_link_items(elements, base_url):
             title = clean_item_title(raw_title, published_text)
             if not title:
                 title = clean_item_title(container_text, published_text)
-            if not title:
-                title = absolute_url
+            if not is_probable_content_link(title, absolute_url, base_url):
+                continue
 
             seen.add(absolute_url)
             items.append({
@@ -522,7 +556,9 @@ def serialize_link_items(link_items):
         if not url or url in seen:
             continue
         published = item.get("published") or item.get("published_text") or ""
-        title = clean_item_title(item.get("title"), published) or url
+        title = clean_item_title(item.get("title"), published)
+        if not is_probable_content_link(title, url, ""):
+            continue
         normalized_items.append({
             "title": title,
             "url": url,
