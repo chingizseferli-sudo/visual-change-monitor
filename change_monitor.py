@@ -813,11 +813,27 @@ def extract_text_from_elements(elements, max_chars):
         text = element.get_text(" ", strip=True)
         if text:
             chunks.append(text)
+
+        for attr in ("title", "aria-label", "data-title", "data-name"):
+            value = element.get(attr) if hasattr(element, "get") else ""
+            if value:
+                chunks.append(value)
+
         if hasattr(element, "select"):
-            for image in element.select("img[alt], img[title]")[:10]:
+            for child in element.select("[title], [aria-label], [data-title], [data-name]")[:20]:
+                for attr in ("title", "aria-label", "data-title", "data-name"):
+                    value = child.get(attr)
+                    if value:
+                        chunks.append(value)
+            for image in element.select("img[alt], img[title]")[:20]:
                 label = image.get("alt") or image.get("title") or ""
                 if label:
                     chunks.append(label)
+            for anchor in element.select("a[href]")[:20]:
+                href = anchor.get("href") or ""
+                if href:
+                    chunks.append(href)
+
     content_text = normalize_text("\n".join(chunks), max_chars)
     if max_chars and len(content_text) > max_chars:
         content_text = content_text[:max_chars]
@@ -859,8 +875,16 @@ def build_selected_content(html, selector, base_url, max_chars):
             break
 
     if not matched_any:
+        print(
+            f"Selector missing: selector={selector} | html_chars={len(html or '')} | candidates={len(build_selector_candidates(selector))}",
+            flush=True,
+        )
         raise ValueError("selector_missing")
     if not last_content_text:
+        print(
+            f"Selector empty: selector={selector} | html_chars={len(html or '')} | candidates={len(build_selector_candidates(selector))}",
+            flush=True,
+        )
         raise ValueError("empty_content")
 
     return last_content_text, last_link_items
@@ -984,8 +1008,9 @@ def fetch_source(source, config, force_full=False):
 
     response_time_ms = int((time.monotonic() - started) * 1000)
     status = response.status_code
+    content_type = response.headers.get("Content-Type", "")
     print(
-        f"Fetch completed: {source.get('name') or url} | status={status} | time={response_time_ms}ms",
+        f"Fetch completed: {source.get('name') or url} | status={status} | time={response_time_ms}ms | content_type={content_type or '-'} | chars={len(response.text or '')}",
         flush=True,
     )
     if status == 304:
@@ -1005,8 +1030,8 @@ def fetch_source(source, config, force_full=False):
     if status >= 400:
         raise RuntimeError(f"http_{status}")
 
-    content_type = response.headers.get("Content-Type", "").lower()
-    if content_type and "html" not in content_type and "text" not in content_type:
+    normalized_content_type = content_type.lower()
+    if normalized_content_type and "html" not in normalized_content_type and "text" not in normalized_content_type:
         raise ValueError("unsupported_content_type")
 
     return {
