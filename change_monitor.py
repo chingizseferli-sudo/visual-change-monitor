@@ -58,6 +58,7 @@ def get_env():
         "min_interval_minutes": as_int("MIN_INTERVAL_MINUTES", 5),
         "request_timeout_seconds": as_int("REQUEST_TIMEOUT_SECONDS", 20),
         "domain_min_delay_seconds": as_int("DOMAIN_MIN_DELAY_SECONDS", 10),
+        "item_freshness_days": as_int("ITEM_FRESHNESS_DAYS", 3),
         "jitter_fast_min": as_int("JITTER_SECONDS_MIN_FAST", 0),
         "jitter_fast_max": as_int("JITTER_SECONDS_MAX_FAST", 20),
         "jitter_normal_min": as_int("JITTER_SECONDS_MIN_NORMAL", 10),
@@ -819,6 +820,49 @@ def find_new_link_items(previous_text, current_text):
     return previous_items, current_items, new_items
 
 
+def comparable_item_value(item):
+    published = item.get("published_text") or item.get("published") or ""
+    return {
+        "title": clean_item_title(item.get("title"), published),
+        "published": published,
+        "image": item.get("image") or "",
+    }
+
+
+def compare_snapshot_items(previous_text, current_text):
+    previous_items = parse_link_items_from_snapshot(previous_text)
+    current_items = parse_link_items_from_snapshot(current_text)
+    previous_by_url = {item["url"]: item for item in previous_items if item.get("url")}
+    current_by_url = {item["url"]: item for item in current_items if item.get("url")}
+
+    added_items = [item for url, item in current_by_url.items() if url not in previous_by_url]
+    removed_items = [item for url, item in previous_by_url.items() if url not in current_by_url]
+    changed_items = []
+
+    for url, current_item in current_by_url.items():
+        previous_item = previous_by_url.get(url)
+        if not previous_item:
+            continue
+        if comparable_item_value(previous_item) != comparable_item_value(current_item):
+            changed_items.append({
+                "url": url,
+                "before": previous_item,
+                "after": current_item,
+                "title": current_item.get("title") or previous_item.get("title") or url,
+                "published": current_item.get("published") or current_item.get("published_text") or "",
+                "published_text": current_item.get("published_text") or current_item.get("published") or "",
+                "image": current_item.get("image") or "",
+            })
+
+    return {
+        "previous_items": previous_items,
+        "current_items": current_items,
+        "added_items": added_items,
+        "removed_items": removed_items,
+        "changed_items": changed_items,
+    }
+
+
 def build_selector_candidates(selector):
     clean = " ".join((selector or "").split()).strip()
     if not clean:
@@ -1159,6 +1203,29 @@ def build_link_diff_summary(new_items, limit=10):
     return "\n".join(lines)
 
 
+def build_url_compare_summary(added_items, removed_items, changed_items, limit=5):
+    lines = [
+        "URL müqayisəsi:",
+        f"Əlavə olunan: {len(added_items)}",
+        f"Silinən: {len(removed_items)}",
+        f"Dəyişən: {len(changed_items)}",
+    ]
+
+    if added_items:
+        lines.append("")
+        lines.append("Yeni linklər:")
+        for item in added_items[:limit]:
+            title = clean_item_title(item.get("title"), item.get("published_text") or item.get("published")) or item.get("url")
+            published = item.get("published_text") or item.get("published") or ""
+            suffix = f" — {published}" if published else ""
+            lines.append(f"- {truncate_item(title, 180)} — {item.get('url')}{suffix}")
+        extra = len(added_items) - limit
+        if extra > 0:
+            lines.append(f"... və {extra} əlavə")
+
+    return "\n".join(lines)
+
+
 def format_baku_time(value=None):
     dt = value or utc_now()
     return dt.astimezone(timezone(timedelta(hours=4))).strftime("%d.%m.%Y %H:%M")
@@ -1252,18 +1319,18 @@ def build_link_telegram_message(name, source_url, new_items, limit=10):
     time_value = published_text or format_baku_time()
 
     message = f"""
-🆕 Yeni paylaşım
+🔔 Yeni paylaşım tapıldı
 
-📌 Başlıq:
-{truncate_item(title, 220)}
-
-🌐 Mənbə:
+Mənbə:
 {name or '-'}
 
-🕒 {time_label}:
+Başlıq:
+{truncate_item(title, 220)}
+
+{time_label}:
 {time_value or '-'}
 
-🔗 Link:
+Link:
 {item_url or '-'}
 """.strip()
 
@@ -1388,15 +1455,27 @@ def check_source(source, config, domain_limiter):
             )
         latest_snapshot = get_latest_snapshot(source_id, config)
         previous_text = latest_snapshot.get("content_text") if latest_snapshot else ""
-        previous_link_items, current_link_items, new_link_items = find_new_link_items(previous_text or "", content_text)
+        item_compare = compare_snapshot_items(previous_text or "", content_text)
+        previous_link_items = item_compare["previous_items"]
+        current_link_items = item_compare["current_items"]
+        added_items = item_compare["added_items"]
+        removed_items = item_compare["removed_items"]
+        changed_items = item_compare["changed_items"]
         seen_link_urls = get_seen_link_urls(source_id, config) if current_link_items else set()
-        first_seen_new_link_items = [
-            item for item in new_link_items
+        first_seen_added_items = [
+            item for item in added_items
             if normalize_item_url(item.get("url"), "") not in seen_link_urls
         ]
-        fallback_text_diff = not first_seen_new_link_items
+        fresh_first_seen_added_items = [
+            item for item in first_seen_added_items
+            if not is_old_published_item(
+                item.get("published_text") or item.get("published") or "",
+                config["item_freshness_days"],
+            )
+        ]
+        fallback_text_diff = not added_items
         print(
-            f"Link diff: {name} | previous_link_count={len(previous_link_items)} | current_link_count={len(current_link_items)} | new_link_count={len(new_link_items)} | first_seen_new_link_count={len(first_seen_new_link_items)} | seen_history_count={len(seen_link_urls)} | fallback_text_diff={fallback_text_diff}",
+            f"URL compare: {name} | previous_item_count={len(previous_link_items)} | current_item_count={len(current_link_items)} | added={len(added_items)} | removed={len(removed_items)} | changed={len(changed_items)} | first_seen_added={len(first_seen_added_items)} | telegram_added={len(fresh_first_seen_added_items)} | seen_history_count={len(seen_link_urls)} | fallback_text_diff={fallback_text_diff}",
             flush=True,
         )
 
@@ -1409,26 +1488,17 @@ def check_source(source, config, domain_limiter):
             config,
         )
 
-        if current_link_items and not first_seen_new_link_items:
-            payload = success_source_payload(source, new_hash, fetch_result, config)
-            update_source(source_id, payload, config)
-            print(f"No first-seen link change: {name} | snapshot={new_snapshot.get('id') if new_snapshot else None}", flush=True)
-            return
-
-        fresh_first_seen_link_items = [
-            item for item in first_seen_new_link_items
-            if not is_old_published_item(item.get("published_text") or item.get("published") or "")
-        ]
-        if first_seen_new_link_items and not fresh_first_seen_link_items:
-            payload = success_source_payload(source, new_hash, fetch_result, config)
-            update_source(source_id, payload, config)
-            print(f"Only old dated links changed: {name} | snapshot={new_snapshot.get('id') if new_snapshot else None}", flush=True)
-            return
-
-        if fresh_first_seen_link_items:
-            diff_summary = build_link_diff_summary(fresh_first_seen_link_items)
+        if current_link_items:
+            diff_summary = build_url_compare_summary(added_items, removed_items, changed_items)
         else:
-            diff_summary = "Mətn dəyişikliyi aşkarlandı, yeni link tapılmadı."
+            added_lines, removed_lines = compare_change_lines(previous_text or "", content_text)
+            diff_summary = (
+                "URL müqayisəsi:\n"
+                "Əlavə olunan: 0\n"
+                "Silinən: 0\n"
+                "Dəyişən: 0\n\n"
+                f"Mətn dəyişikliyi: əlavə sətir={len(added_lines)}, silinən sətir={len(removed_lines)}"
+            )
         event = insert_change_event(
             source_id,
             latest_snapshot.get("id") if latest_snapshot else None,
@@ -1439,7 +1509,7 @@ def check_source(source, config, domain_limiter):
             config,
         )
         chat_id = source.get("telegram_chat_id") or config["default_chat_id"]
-        telegram_items = fresh_first_seen_link_items
+        telegram_items = fresh_first_seen_added_items
         message = build_link_telegram_message(name, source.get("url"), telegram_items) if telegram_items else ""
 
         if message:
