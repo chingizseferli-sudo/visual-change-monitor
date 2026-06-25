@@ -1163,7 +1163,7 @@ def pick_telegram_item(items):
             fallback.append(normalized)
     if usable:
         return usable[0]
-    return fallback[0] if fallback else {}
+    return {}
 
 
 def sanitize_telegram_summary(summary):
@@ -1197,7 +1197,11 @@ def build_telegram_message(name, url, diff_summary):
 def build_link_telegram_message(name, source_url, new_items, limit=10):
     fresh_items = [item for item in (new_items or []) if not is_old_published_item(item.get("published_text") or item.get("published") or "")]
     item = pick_telegram_item(fresh_items)
-    title = clean_item_title(item.get("title"), item.get("published_text")) or "Seçilmiş hissədə dəyişiklik var"
+    if not item:
+        return ""
+    title = clean_item_title(item.get("title"), item.get("published_text"))
+    if not is_telegram_title_usable(title, item.get("url") or ""):
+        return ""
     item_url = item.get("url") or source_url or ""
     published_text = item.get("published_text") or item.get("published") or ""
     extra = max(0, len(fresh_items) - 1)
@@ -1381,7 +1385,7 @@ def check_source(source, config, domain_limiter):
         if fresh_first_seen_link_items:
             diff_summary = build_link_diff_summary(fresh_first_seen_link_items)
         else:
-            diff_summary = "Seçilmiş hissədə dəyişiklik var."
+            diff_summary = "Mətn dəyişikliyi aşkarlandı, yeni link tapılmadı."
         event = insert_change_event(
             source_id,
             latest_snapshot.get("id") if latest_snapshot else None,
@@ -1392,19 +1396,21 @@ def check_source(source, config, domain_limiter):
             config,
         )
         chat_id = source.get("telegram_chat_id") or config["default_chat_id"]
-        alert = insert_alert(event.get("id") if event else None, source_id, chat_id, config)
-
         telegram_items = fresh_first_seen_link_items
-        message = (
-            build_link_telegram_message(name, source.get("url"), telegram_items)
-            if telegram_items
-            else build_telegram_message(name, source.get("url"), diff_summary)
-        )
-        ok, error = send_telegram(config, chat_id, message)
-        if ok:
-            update_alert(alert.get("id") if alert else None, {"status": "sent", "sent_at": iso_now(), "error": None}, config)
+        message = build_link_telegram_message(name, source.get("url"), telegram_items) if telegram_items else ""
+
+        if message:
+            alert = insert_alert(event.get("id") if event else None, source_id, chat_id, config)
+            ok, error = send_telegram(config, chat_id, message)
+            if ok:
+                update_alert(alert.get("id") if alert else None, {"status": "sent", "sent_at": iso_now(), "error": None}, config)
+            else:
+                update_alert(alert.get("id") if alert else None, {"status": "failed", "error": error}, config)
         else:
-            update_alert(alert.get("id") if alert else None, {"status": "failed", "error": error}, config)
+            print(
+                f"Telegram skipped: {name} | reason=no_clean_new_link | hash_state={hash_state}",
+                flush=True,
+            )
 
         payload = success_source_payload(source, new_hash, fetch_result, config, changed=True)
         update_source(source_id, payload, config)
