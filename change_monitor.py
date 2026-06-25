@@ -688,30 +688,72 @@ def extract_link_items(elements, base_url):
             })
     return items
 
-def serialize_link_items(link_items):
+
+def normalize_snapshot_item(item):
+    item = item or {}
+    published = item.get("published") or item.get("published_text") or ""
+    url = normalize_item_url(item.get("url"), "")
+    title = clean_item_title(item.get("title"), published)
+    return {
+        "title": title or url,
+        "url": url,
+        "published": published,
+        "image": item.get("image") or "",
+    }
+
+
+def serialize_structured_snapshot(items):
     normalized_items = []
     seen = set()
-    for item in link_items or []:
-        url = normalize_item_url(item.get("url"), "")
-        if not url or url in seen:
+    for item in items or []:
+        normalized = normalize_snapshot_item(item)
+        url = normalized.get("url") or ""
+        dedupe_key = url or normalized.get("title") or ""
+        if not dedupe_key or dedupe_key in seen:
             continue
-        published = item.get("published") or item.get("published_text") or ""
-        title = clean_item_title(item.get("title"), published)
-        if not is_probable_content_link(title, url, ""):
+        if url and not is_probable_content_link(normalized.get("title"), url, ""):
             continue
-        normalized_items.append({
-            "title": title,
-            "url": url,
-            "published": published,
-            "image": item.get("image") or "",
-        })
-        seen.add(url)
+        normalized_items.append(normalized)
+        seen.add(dedupe_key)
 
     return json.dumps(
         {"items": normalized_items},
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def serialize_link_items(link_items):
+    return serialize_structured_snapshot(link_items)
+
+
+def extract_text_snapshot_items(content_text, limit=40):
+    items = []
+    seen = set()
+    for line in (content_text or "").splitlines():
+        title = clean_item_title(line, "")
+        if not title:
+            continue
+        compact = re.sub(r"\W+", "", title, flags=re.UNICODE)
+        if len(compact) < 8 or compact in seen:
+            continue
+        seen.add(compact)
+        items.append({
+            "title": title,
+            "url": "",
+            "published": extract_published_text(title) or "",
+            "image": "",
+        })
+        if len(items) >= limit:
+            break
+    return items
+
+
+def serialize_text_snapshot(content_text):
+    text_items = extract_text_snapshot_items(content_text)
+    if text_items:
+        return serialize_structured_snapshot(text_items)
+    return content_text
 
 def parse_link_items_from_snapshot(text):
     items = []
@@ -865,7 +907,8 @@ def build_selected_content(html, selector, base_url, max_chars):
         if link_items:
             content_text = serialize_link_items(link_items)
         else:
-            content_text = extract_text_from_elements(elements, max_chars)
+            raw_text = extract_text_from_elements(elements, max_chars)
+            content_text = serialize_text_snapshot(raw_text)
 
         last_content_text = content_text
         last_link_items = link_items
