@@ -865,24 +865,45 @@ def fetch_source(source, config, force_full=False):
     if not url.startswith(("http://", "https://")):
         raise ValueError("invalid_url")
 
-    headers = {
+    base_headers = {
         "User-Agent": config["user_agent"],
         "Accept": "text/html,application/xhtml+xml",
     }
     if not force_full and source.get("etag"):
-        headers["If-None-Match"] = source["etag"]
+        base_headers["If-None-Match"] = source["etag"]
     if not force_full and source.get("last_modified"):
-        headers["If-Modified-Since"] = source["last_modified"]
+        base_headers["If-Modified-Since"] = source["last_modified"]
+
+    browser_headers = {
+        **base_headers,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "az-AZ,az;q=0.9,en-US;q=0.8,en;q=0.7,tr;q=0.6",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
+    }
 
     print(f"Fetch started: {source.get('name') or url} | {url}", flush=True)
     started = time.monotonic()
     try:
         response = requests.get(
             url,
-            headers=headers,
+            headers=base_headers,
             timeout=config["request_timeout_seconds"],
             allow_redirects=True,
         )
+        if response.status_code in {403, 429}:
+            print(
+                f"Fetch retry with browser headers: {source.get('name') or url} | status={response.status_code}",
+                flush=True,
+            )
+            response = requests.get(
+                url,
+                headers=browser_headers,
+                timeout=config["request_timeout_seconds"],
+                allow_redirects=True,
+            )
     except requests.Timeout as exc:
         raise TimeoutError("timeout") from exc
     except requests.RequestException as exc:
