@@ -1,4 +1,4 @@
-import hashlib
+﻿import hashlib
 import os
 import random
 import json
@@ -525,12 +525,20 @@ def best_title_candidate(anchor, container, published_text):
         if heading:
             candidates.append(heading.get_text(" ", strip=True))
         candidates.append(anchor.get_text(" ", strip=True))
+        image = anchor.find("img")
+        if image:
+            for attr in ("alt", "title", "aria-label"):
+                value = image.get(attr)
+                if value:
+                    candidates.append(value)
 
     if container:
         for selector in ["h1", "h2", "h3", "h4", ".title", ".news-title", ".post-title", "[class*='title']"]:
             found = container.select_one(selector) if hasattr(container, "select_one") else None
             if found:
                 candidates.append(found.get_text(" ", strip=True))
+        for image in container.select("img[alt], img[title]")[:5] if hasattr(container, "select") else []:
+            candidates.append(image.get("alt") or image.get("title") or "")
 
     cleaned = []
     for candidate in candidates:
@@ -769,28 +777,93 @@ def find_new_link_items(previous_text, current_text):
     return previous_items, current_items, new_items
 
 
+def build_selector_candidates(selector):
+    clean = " ".join((selector or "").split()).strip()
+    if not clean:
+        return []
+
+    candidates = []
+
+    def add(candidate):
+        candidate = " ".join((candidate or "").split()).strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(clean)
+
+    no_nth = re.sub(r":nth-(?:of-type|child)\([^)]*\)", "", clean)
+    add(no_nth)
+
+    # Browser-picked selectors can be too narrow. If the exact DOM path is not
+    # present in server HTML, try wider parent selectors before failing.
+    parts = [part.strip() for part in clean.split(" > ") if part.strip()]
+    for cut in range(len(parts) - 1, 0, -1):
+        add(" > ".join(parts[:cut]))
+
+    no_nth_parts = [part.strip() for part in no_nth.split(" > ") if part.strip()]
+    for cut in range(len(no_nth_parts) - 1, 0, -1):
+        add(" > ".join(no_nth_parts[:cut]))
+
+    return candidates
+
+
+def extract_text_from_elements(elements, max_chars):
+    chunks = []
+    for element in elements:
+        text = element.get_text(" ", strip=True)
+        if text:
+            chunks.append(text)
+        if hasattr(element, "select"):
+            for image in element.select("img[alt], img[title]")[:10]:
+                label = image.get("alt") or image.get("title") or ""
+                if label:
+                    chunks.append(label)
+    content_text = normalize_text("\n".join(chunks), max_chars)
+    if max_chars and len(content_text) > max_chars:
+        content_text = content_text[:max_chars]
+    return content_text
+
+
 def build_selected_content(html, selector, base_url, max_chars):
     if not selector or not selector.strip():
         raise ValueError("selector_missing")
     soup = BeautifulSoup(html or "", "lxml")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-    elements = soup.select(selector)
-    if not elements:
+
+    matched_any = False
+    last_content_text = ""
+    last_link_items = []
+
+    for candidate in build_selector_candidates(selector):
+        try:
+            elements = soup.select(candidate)
+        except Exception as exc:
+            print(f"Selector candidate invalid: {candidate} | {exc}", flush=True)
+            continue
+        if not elements:
+            continue
+
+        matched_any = True
+        link_items = extract_link_items(elements, base_url)
+        if link_items:
+            content_text = serialize_link_items(link_items)
+        else:
+            content_text = extract_text_from_elements(elements, max_chars)
+
+        last_content_text = content_text
+        last_link_items = link_items
+        if content_text:
+            if candidate != selector:
+                print(f"Selector fallback matched: original={selector} | used={candidate}", flush=True)
+            break
+
+    if not matched_any:
         raise ValueError("selector_missing")
+    if not last_content_text:
+        raise ValueError("empty_content")
 
-    link_items = extract_link_items(elements, base_url)
-    if link_items:
-        # Structured snapshot: URL is now the primary comparison unit.
-        # Do not trim this JSON by character count, because truncation would break parsing.
-        content_text = serialize_link_items(link_items)
-    else:
-        raw_text = "\n".join(element.get_text(" ", strip=True) for element in elements)
-        content_text = normalize_text(raw_text, max_chars)
-        if max_chars and len(content_text) > max_chars:
-            content_text = content_text[:max_chars]
-
-    return content_text, link_items
+    return last_content_text, last_link_items
 
 def extract_selected_content(html, selector):
     content_text, _link_items = build_selected_content(html, selector, "", 0)
@@ -1355,3 +1428,4 @@ def run_loop():
 
 if __name__ == "__main__":
     run_loop()
+
