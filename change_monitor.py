@@ -580,11 +580,15 @@ def clean_item_title(raw_title, published_text=""):
             title = " ".join(words[size:]).strip()
             break
     for _ in range(3):
-        parts = re.split(r"\s*[-–—|•·:]+\s*", title, maxsplit=1)
+        # Only strip category/source prefixes when the separator is a real label
+        # separator. Hyphenated Azerbaijani suffixes such as "ATU-da" or
+        # "DİM-də" are part of the title and must never be split.
+        parts = re.split(r"\s+(?:[-–—|•·])\s+|\s*[:：]\s+", title, maxsplit=1)
         if len(parts) != 2:
             break
-        prefix = parts[0].strip().casefold()
-        if prefix in CATEGORY_PREFIXES or (len(parts[0].strip()) <= 24 and parts[0].strip().isupper()):
+        raw_prefix = parts[0].strip()
+        prefix = raw_prefix.casefold()
+        if prefix in CATEGORY_PREFIXES or (len(raw_prefix) <= 24 and raw_prefix.isupper() and len(raw_prefix.split()) > 1):
             title = parts[1].strip()
             continue
         break
