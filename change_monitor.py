@@ -728,6 +728,76 @@ def serialize_link_items(link_items):
     return serialize_structured_snapshot(link_items)
 
 
+def _public_base_from_api_url(base_url):
+    parsed = urlparse(base_url or "")
+    if not parsed.scheme or not parsed.netloc:
+        return base_url
+    host = parsed.netloc
+    if host.startswith("api."):
+        host = host[4:]
+    return urlunparse((parsed.scheme, host, "", "", "", ""))
+
+
+def _iter_json_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_json_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_json_dicts(child)
+
+
+def extract_json_snapshot_items(raw_text, base_url, limit=80):
+    try:
+        payload = json.loads(raw_text or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+    parsed_base = urlparse(base_url or "")
+    public_base = _public_base_from_api_url(base_url)
+    items = []
+    seen = set()
+    for item in _iter_json_dicts(payload):
+        title = item.get("title") or item.get("name") or item.get("headline") or item.get("header") or ""
+        slug = item.get("slug") or ""
+        raw_url = item.get("url") or item.get("link") or item.get("href") or item.get("permalink") or ""
+        if not raw_url and slug:
+            if parsed_base.netloc == "api.sport.edu.az":
+                raw_url = f"{public_base}/az/news/{slug}"
+            else:
+                raw_url = urljoin(public_base + "/", str(slug).strip("/"))
+
+        published_parts = [
+            str(item.get(key) or "").strip()
+            for key in ("published", "published_at", "date", "time")
+            if item.get(key)
+        ]
+        published = " ".join(part for part in published_parts if part)
+        image = item.get("image") or item.get("thumbnail") or item.get("photo") or ""
+
+        normalized_url = normalize_item_url(raw_url, public_base)
+        cleaned_title = clean_item_title(title, published)
+        if not cleaned_title or not normalized_url:
+            continue
+        dedupe_key = normalized_url or cleaned_title
+        if dedupe_key in seen:
+            continue
+        if not is_probable_content_link(cleaned_title, normalized_url, public_base):
+            continue
+        seen.add(dedupe_key)
+        items.append({
+            "title": cleaned_title,
+            "url": normalized_url,
+            "published": published,
+            "published_text": published,
+            "image": image,
+        })
+        if len(items) >= limit:
+            break
+    return items
+
+
 def extract_text_snapshot_items(content_text, limit=40):
     items = []
     seen = set()
@@ -948,6 +1018,10 @@ def extract_text_from_elements(elements, max_chars):
 
 
 def build_selected_content(html, selector, base_url, max_chars):
+    json_items = extract_json_snapshot_items(html, base_url)
+    if json_items:
+        return serialize_structured_snapshot(json_items), json_items
+
     if not selector or not selector.strip():
         raise ValueError("selector_missing")
     soup = BeautifulSoup(html or "", "lxml")
@@ -1139,7 +1213,12 @@ def fetch_source(source, config, force_full=False):
         raise RuntimeError(f"http_{status}")
 
     normalized_content_type = content_type.lower()
-    if normalized_content_type and "html" not in normalized_content_type and "text" not in normalized_content_type:
+    if (
+        normalized_content_type
+        and "html" not in normalized_content_type
+        and "text" not in normalized_content_type
+        and "json" not in normalized_content_type
+    ):
         raise ValueError("unsupported_content_type")
 
     return {
