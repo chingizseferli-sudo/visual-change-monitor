@@ -623,6 +623,26 @@ def normalize_item_url(href, base_url):
     return urlunparse((parsed.scheme, parsed.netloc.lower(), path, parsed.params, query, ""))
 
 
+LANGUAGE_PATH_SEGMENTS = {"az", "azeri", "az-az", "en", "en-us", "ru", "ru-ru", "tr", "tr-tr"}
+
+
+def detect_url_language(url):
+    parsed = urlparse(url or "")
+    for segment in (parsed.path or "").split("/"):
+        lowered = segment.strip().lower()
+        if lowered in LANGUAGE_PATH_SEGMENTS:
+            return lowered.split("-")[0]
+    return ""
+
+
+def matches_source_language(item_url, base_url):
+    source_language = detect_url_language(base_url)
+    if not source_language:
+        return True
+    item_language = detect_url_language(item_url)
+    return not item_language or item_language == source_language
+
+
 IGNORED_LINK_TITLES = {
     "daha ətraflı", "daha etrafli", "ətraflı", "etrafli", "read more",
     "more", "next", "previous", "növbəti", "novbeti", "əvvəlki", "evvelki",
@@ -665,6 +685,8 @@ def extract_link_items(elements, base_url):
         for anchor in anchors:
             absolute_url = normalize_item_url(anchor.get("href"), base_url)
             if not absolute_url or absolute_url in seen:
+                continue
+            if not matches_source_language(absolute_url, base_url):
                 continue
 
             container = anchor.find_parent(["article", "li", "div", "section"]) or anchor.parent or element
@@ -780,6 +802,8 @@ def extract_json_snapshot_items(raw_text, base_url, limit=80):
         cleaned_title = clean_item_title(title, published)
         if not cleaned_title or not normalized_url:
             continue
+        if not matches_source_language(normalized_url, public_base):
+            continue
         dedupe_key = normalized_url or cleaned_title
         if dedupe_key in seen:
             continue
@@ -795,6 +819,23 @@ def extract_json_snapshot_items(raw_text, base_url, limit=80):
         })
         if len(items) >= limit:
             break
+    return items
+
+
+def extract_embedded_json_snapshot_items(html, base_url, limit=80):
+    soup = BeautifulSoup(html or "", "lxml")
+    items = []
+    seen = set()
+    for script in soup.select('script[type*="ld+json"], script[type="application/json"]'):
+        raw_text = script.string or script.get_text("", strip=True)
+        for item in extract_json_snapshot_items(raw_text, base_url, limit=limit):
+            dedupe_key = item.get("url") or item.get("title") or ""
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            items.append(item)
+            if len(items) >= limit:
+                return items
     return items
 
 
@@ -1021,6 +1062,10 @@ def build_selected_content(html, selector, base_url, max_chars):
     json_items = extract_json_snapshot_items(html, base_url)
     if json_items:
         return serialize_structured_snapshot(json_items), json_items
+
+    embedded_json_items = extract_embedded_json_snapshot_items(html, base_url)
+    if embedded_json_items:
+        return serialize_structured_snapshot(embedded_json_items), embedded_json_items
 
     if not selector or not selector.strip():
         raise ValueError("selector_missing")
