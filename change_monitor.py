@@ -1,4 +1,4 @@
-﻿import hashlib
+import hashlib
 import os
 import random
 import json
@@ -64,7 +64,7 @@ def get_env():
         "jitter_normal_min": as_int("JITTER_SECONDS_MIN_NORMAL", 10),
         "jitter_normal_max": as_int("JITTER_SECONDS_MAX_NORMAL", 45),
         "max_backoff_minutes": as_int("MAX_BACKOFF_MINUTES", 120),
-        "user_agent": os.getenv("USER_AGENT", "VisualMonitorChangeBot/1.0").strip(),
+        "user_agent": os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36").strip(),
         "snapshot_text_max_chars": as_int("SNAPSHOT_TEXT_MAX_CHARS", 50000),
         "dry_run": as_bool(os.getenv("DRY_RUN", "true")),
     }
@@ -889,6 +889,27 @@ def build_selector_candidates(selector):
     no_nth_parts = [part.strip() for part in no_nth.split(" > ") if part.strip()]
     for cut in range(len(no_nth_parts) - 1, 0, -1):
         add(" > ".join(no_nth_parts[:cut]))
+
+    # Modern Next/Vue pages often render the exact browser-picked path only
+    # after hydration. The worker reads server HTML, so try stable semantic
+    # containers before marking the watch as broken.
+    for generic in (
+        "main",
+        "article",
+        "section",
+        "[class*=news]",
+        "[class*=News]",
+        "[class*=xeber]",
+        "[class*=post]",
+        "[class*=card]",
+        "[class*=grid]",
+        "[class*=list]",
+        "a[href*=news]",
+        "a[href*=xeber]",
+        "a[href*=media]",
+        "a[href*=allnews]",
+    ):
+        add(generic)
 
     return candidates
 
