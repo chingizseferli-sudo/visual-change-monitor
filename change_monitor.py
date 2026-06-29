@@ -784,9 +784,9 @@ def extract_json_snapshot_items(raw_text, base_url, limit=80):
     items = []
     seen = set()
     for item in _iter_json_dicts(payload):
-        title = item.get("title") or item.get("name") or item.get("headline") or item.get("header") or ""
-        slug = item.get("slug") or ""
-        raw_url = item.get("url") or item.get("link") or item.get("href") or item.get("permalink") or ""
+        title = str(item.get("title") or item.get("name") or item.get("headline") or item.get("header") or "")
+        slug = str(item.get("slug") or "")
+        raw_url = str(item.get("url") or item.get("link") or item.get("href") or item.get("permalink") or "")
         if not raw_url and slug:
             if parsed_base.netloc == "api.sport.edu.az":
                 raw_url = f"{public_base}/az/news/{slug}"
