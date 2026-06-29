@@ -950,7 +950,7 @@ def compare_snapshot_items(previous_text, current_text):
     current_by_url = {item["url"]: item for item in current_items if item.get("url")}
 
     added_items = [item for url, item in current_by_url.items() if url not in previous_by_url]
-    removed_items = [item for url, item in previous_by_url.items() if url not in current_by_url]
+    missing_items = [item for url, item in previous_by_url.items() if url not in current_by_url]
     changed_items = []
 
     for url, current_item in current_by_url.items():
@@ -972,9 +972,58 @@ def compare_snapshot_items(previous_text, current_text):
         "previous_items": previous_items,
         "current_items": current_items,
         "added_items": added_items,
-        "removed_items": removed_items,
+        "missing_items": missing_items,
+        "removed_items": [],
         "changed_items": changed_items,
     }
+
+
+def verify_removed_link_items(candidate_items, config, limit=20):
+    real_removed = []
+    unresolved = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "az-AZ,az;q=0.9,en-US;q=0.8,en;q=0.7,tr;q=0.6",
+    }
+
+    for item in (candidate_items or [])[:limit]:
+        url = normalize_item_url(item.get("url"), "")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+            unresolved.append({**item, "removal_check": "unsafe_or_invalid_url"})
+            continue
+
+        try:
+            response = requests.head(
+                url,
+                headers=headers,
+                timeout=min(config.get("request_timeout_seconds") or 20, 10),
+                allow_redirects=True,
+            )
+            if response.status_code in {405, 403, 429}:
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=min(config.get("request_timeout_seconds") or 20, 10),
+                    allow_redirects=True,
+                    stream=True,
+                )
+                response.close()
+        except requests.RequestException as exc:
+            unresolved.append({**item, "removal_check": f"check_failed:{type(exc).__name__}"})
+            continue
+
+        if response.status_code in {404, 410}:
+            real_removed.append({**item, "removal_check": f"http_{response.status_code}"})
+        else:
+            unresolved.append({**item, "removal_check": f"still_available:http_{response.status_code}"})
+
+    if len(candidate_items or []) > limit:
+        for item in (candidate_items or [])[limit:]:
+            unresolved.append({**item, "removal_check": "not_checked_limit"})
+
+    return real_removed, unresolved
 
 
 def build_selector_candidates(selector):
@@ -1351,13 +1400,16 @@ def build_link_diff_summary(new_items, limit=10):
     return "\n".join(lines)
 
 
-def build_url_compare_summary(added_items, removed_items, changed_items, limit=5):
+def build_url_compare_summary(added_items, removed_items, changed_items, unresolved_missing_items=None, limit=5):
+    unresolved_missing_items = unresolved_missing_items or []
     lines = [
         "URL müqayisəsi:",
         f"Əlavə olunan: {len(added_items)}",
         f"Silinən: {len(removed_items)}",
         f"Dəyişən: {len(changed_items)}",
     ]
+    if unresolved_missing_items:
+        lines.append(f"Listdən çıxan, silinmə təsdiqlənməyən: {len(unresolved_missing_items)}")
 
     if added_items:
         lines.append("")
@@ -1368,6 +1420,18 @@ def build_url_compare_summary(added_items, removed_items, changed_items, limit=5
             suffix = f" — {published}" if published else ""
             lines.append(f"- {truncate_item(title, 180)} — {item.get('url')}{suffix}")
         extra = len(added_items) - limit
+        if extra > 0:
+            lines.append(f"... və {extra} əlavə")
+
+    if removed_items:
+        lines.append("")
+        lines.append("Təsdiqlənmiş silinən linklər:")
+        for item in removed_items[:limit]:
+            title = clean_item_title(item.get("title"), item.get("published_text") or item.get("published")) or item.get("url")
+            check = item.get("removal_check") or ""
+            suffix = f" — {check}" if check else ""
+            lines.append(f"- {truncate_item(title, 180)} — {item.get('url')}{suffix}")
+        extra = len(removed_items) - limit
         if extra > 0:
             lines.append(f"... və {extra} əlavə")
 
@@ -1607,7 +1671,8 @@ def check_source(source, config, domain_limiter):
         previous_link_items = item_compare["previous_items"]
         current_link_items = item_compare["current_items"]
         added_items = item_compare["added_items"]
-        removed_items = item_compare["removed_items"]
+        missing_items = item_compare["missing_items"]
+        removed_items, unresolved_missing_items = verify_removed_link_items(missing_items, config)
         changed_items = item_compare["changed_items"]
         seen_link_urls = get_seen_link_urls(source_id, config) if current_link_items else set()
         first_seen_added_items = [
@@ -1621,9 +1686,9 @@ def check_source(source, config, domain_limiter):
                 config["item_freshness_days"],
             )
         ]
-        fallback_text_diff = not added_items
+        fallback_text_diff = not added_items and not removed_items and not changed_items
         print(
-            f"URL compare: {name} | previous_item_count={len(previous_link_items)} | current_item_count={len(current_link_items)} | added={len(added_items)} | removed={len(removed_items)} | changed={len(changed_items)} | first_seen_added={len(first_seen_added_items)} | telegram_added={len(fresh_first_seen_added_items)} | seen_history_count={len(seen_link_urls)} | fallback_text_diff={fallback_text_diff}",
+            f"URL compare: {name} | previous_item_count={len(previous_link_items)} | current_item_count={len(current_link_items)} | added={len(added_items)} | missing={len(missing_items)} | removed={len(removed_items)} | missing_unverified={len(unresolved_missing_items)} | changed={len(changed_items)} | first_seen_added={len(first_seen_added_items)} | telegram_added={len(fresh_first_seen_added_items)} | seen_history_count={len(seen_link_urls)} | fallback_text_diff={fallback_text_diff}",
             flush=True,
         )
 
@@ -1637,7 +1702,7 @@ def check_source(source, config, domain_limiter):
         )
 
         if current_link_items:
-            diff_summary = build_url_compare_summary(added_items, removed_items, changed_items)
+            diff_summary = build_url_compare_summary(added_items, removed_items, changed_items, unresolved_missing_items)
         else:
             added_lines, removed_lines = compare_change_lines(previous_text or "", content_text)
             diff_summary = (
