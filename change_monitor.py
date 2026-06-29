@@ -632,14 +632,17 @@ def detect_url_language(url):
         lowered = segment.strip().lower()
         if lowered in LANGUAGE_PATH_SEGMENTS:
             return lowered.split("-")[0]
+        for language in ("az", "en", "ru", "tr"):
+            if lowered == f"{language}_{language}" or lowered.endswith(f"_{language}"):
+                return language
     return ""
 
 
 def matches_source_language(item_url, base_url):
     source_language = detect_url_language(base_url)
-    if not source_language:
-        return True
     item_language = detect_url_language(item_url)
+    if not source_language:
+        return item_language != "ru"
     return not item_language or item_language == source_language
 
 
